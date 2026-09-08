@@ -1,0 +1,11 @@
+__pycache__/
+*.pyc
+.venv/
+.ruff_cache/
+# CUDA build artifacts
+cuda/mxfp4
+cuda/mxfp4.exe
+cuda/mxfp4.cubin
+cuda/mxfp4.obj
+cuda/test_unpack
+cuda/test_unpack.exe
