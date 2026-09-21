@@ -166,3 +166,91 @@ def gmm_knn(n, K=2, dim=32, k=10, sep=2.0, seed=0, dtype="float32") -> Dataset:
     A = symmetric_from_pairs(u, nbr.ravel(), w, n, dtype)
     order = np.random.RandomState(seed + 1).permutation(n)
     return Dataset(f"gmmknn-n{n}-K{K}-k{k}", A, y, K, order)
+
+
+# ----------------------------------------------------------------------------
+# real graphs
+# ----------------------------------------------------------------------------
+
+_OGB = {
+    "ogbn-arxiv": "http://snap.stanford.edu/ogb/data/nodeproppred/arxiv.zip",
+    "ogbn-products": "http://snap.stanford.edu/ogb/data/nodeproppred/products.zip",
+}
+
+
+def _read_csv_gz(zf, member, dtype):
+    with zf.open(member) as fh:
+        raw = gzip.decompress(fh.read())
+    try:
+        import pandas as pd
+        return pd.read_csv(io.BytesIO(raw), header=None).to_numpy(dtype=dtype)
+    except ImportError:
+        return np.loadtxt(io.BytesIO(raw), delimiter=",", dtype=dtype, ndmin=2)
+
+
+def ogbn(name, data_dir="data", seed=0, dtype="float32") -> Dataset:
+    """ogbn-arxiv (temporal: arrival by publication year) or ogbn-products.
+
+    Downloads the raw OGB zip once and caches a compact .npz next to it.
+    Edges are unweighted (w = 1) and symmetrized.
+    """
+    xp = backend.get().xp
+    os.makedirs(data_dir, exist_ok=True)
+    cache = os.path.join(data_dir, f"{name}.npz")
+    if not os.path.exists(cache):
+        url = _OGB[name]
+        zpath = os.path.join(data_dir, os.path.basename(url))
+        if not os.path.exists(zpath):
+            print(f"[data] downloading {url} ...", flush=True)
+            urllib.request.urlretrieve(url, zpath)
+        with zipfile.ZipFile(zpath) as zf:
+            names = zf.namelist()
+            pick = lambda s: next(m for m in names if m.endswith(s))  # noqa: E731
+            edges = _read_csv_gz(zf, pick("raw/edge.csv.gz"), np.int64)
+            labels = _read_csv_gz(zf, pick("raw/node-label.csv.gz"), np.float64)[:, 0]
+            year = None
+            if any(m.endswith("raw/node_year.csv.gz") for m in names):
+                year = _read_csv_gz(zf, pick("raw/node_year.csv.gz"), np.int64)[:, 0]
+        labels = np.nan_to_num(labels, nan=-1).astype(np.int32)
+        np.savez(cache, src=edges[:, 0], dst=edges[:, 1], y=labels,
+                 year=year if year is not None else np.zeros(0, np.int64))
+    z = np.load(cache)
+    n = int(z["y"].shape[0])
+    src, dst = xp.asarray(z["src"]), xp.asarray(z["dst"])
+    A = symmetric_from_pairs(src, dst, xp.ones(src.shape[0], dtype=dtype), n, dtype)
+    A.data[:] = 1.0  # duplicates (u->v and v->u) collapse to weight 1
+    y = xp.asarray(z["y"])
+    K = int(z["y"].max()) + 1
+    rs = np.random.RandomState(seed + 1)
+    if z["year"].size:
+        order = np.lexsort((rs.random_sample(n), z["year"]))  # by year, random within year
+    else:
+        order = rs.permutation(n)
+    return Dataset(name, A, y, K, order)
+
+
+def from_npz(path, dtype="float32", seed=0) -> Dataset:
+    """Bring your own graph: npz with src, dst, y and optional w, order."""
+    xp = backend.get().xp
+    z = np.load(path)
+    n = int(z["y"].shape[0])
+    w = z["w"] if "w" in z else np.ones(z["src"].shape[0])
+    A = symmetric_from_pairs(xp.asarray(z["src"]), xp.asarray(z["dst"]), xp.asarray(w), n, dtype)
+    y = xp.asarray(z["y"].astype(np.int32))
+    order = z["order"] if "order" in z else np.random.RandomState(seed + 1).permutation(n)
+    return Dataset(os.path.basename(path), A, y, int(z["y"].max()) + 1, order)
+
+
+def load(spec: str, *, n=100_000, K=2, deg=10.0, p_in=0.85, knn=10, dim=32,
+         seed=0, dtype="float32", data_dir="data") -> Dataset:
+    if spec == "sbm":
+        return sbm(n, K, deg, p_in, seed, dtype)
+    if spec == "er":
+        return erdos_renyi(n, K, deg, seed, dtype)
+    if spec == "gmm-knn":
+        return gmm_knn(n, K, dim, knn, seed=seed, dtype=dtype)
+    if spec in _OGB:
+        return ogbn(spec, data_dir, seed, dtype)
+    if spec.endswith(".npz"):
+        return from_npz(spec, dtype, seed)
+    raise ValueError(f"unknown dataset {spec!r}")
