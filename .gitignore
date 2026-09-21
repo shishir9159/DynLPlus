@@ -1,0 +1,18 @@
+# whitelist: ignore everything, then allow what belongs in the repo
+*
+!*/
+!/.gitignore
+!/.python-version
+!/pyproject.toml
+!/uv.lock
+!/dynlp/*.py
+!/tests/*.py
+!/scripts/*
+!/results/**
+*.md
+*.pdf
+.venv/
+__pycache__/
+.pytest_cache/
+data/
+results/h100/
