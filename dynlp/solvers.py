@@ -219,3 +219,254 @@ def predict(F, K):
 
 # ----------------------------------------------------------------------------
 # solvers
+# ----------------------------------------------------------------------------
+
+class Solver:
+    name = "base"
+
+    def __init__(self, n_total, K, dtype="float32", store_dtype=None):
+        self.n_total, self.K, self.dtype = n_total, K, np.dtype(dtype)
+        self.store_dtype = np.dtype(store_dtype or dtype)
+        self.C = 1 if K == 2 else K
+        self.F = None
+
+    def _warm(self, sys: System):
+        xp = backend.get().xp
+        if self.F is None:
+            self.F = xp.empty((self.n_total, self.C), dtype=self.store_dtype)
+            self.F[:] = sys.prior.astype(self.store_dtype)
+        return self.F[sys.U].astype(self.dtype)
+
+    def _store(self, sys: System, X):
+        self.F[sys.U] = X
+
+    def scores(self, sys: System):
+        return self.F[sys.U]
+
+    def solve(self, sys: System) -> Stats:
+        raise NotImplementedError
+
+
+class ItLP(Solver):
+    def __init__(self, n_total, K, dtype="float32", delta=1e-4, warm=False, max_iter=200_000):
+        super().__init__(n_total, K, dtype)
+        self.delta, self.warm, self.max_iter = delta, warm, max_iter
+        self.name = "itlp-warm" if warm else "itlp"
+
+    def solve(self, sys):
+        xp = backend.get().xp
+        st = Stats(path="jacobi")
+        sys = sys.astype(self.dtype)
+        with Timer() as tm:
+            if self.warm:
+                X = supernode_init(sys, self._warm(sys), known=~sys.is_new)
+            else:
+                self._warm(sys)
+                X = xp.empty((sys.n_u, self.C), dtype=self.dtype)
+                X[:] = sys.prior
+            for _ in range(self.max_iter):
+                Y = (sys.rhs + spmm(sys.W, X)) / sys.diag[:, None]
+                ch = float(xp.abs(Y - X).max()) if sys.n_u else 0.0
+                X = Y
+                st.iters += 1
+                st.edges += sys.nnz
+                if ch <= self.delta:
+                    break
+            self._store(sys, X)
+        st.ms = tm.ms
+        return st
+
+
+class DynLP(Solver):
+    """Faithful DynLP (Algorithm 2), with |.| in the line-29 change test."""
+
+    def __init__(self, n_total, K, dtype="float32", delta=1e-4, group="auto",
+                 known_init=False, max_iter=10**7):
+        super().__init__(n_total, K, dtype)
+        self.delta, self.group, self.known_init, self.max_iter = delta, group, known_init, max_iter
+        self.name = "dynlp-knowninit" if known_init else "dynlp"
+
+    def solve(self, sys):
+        xp = backend.get().xp
+        st = Stats(path="frontier-jacobi")
+        sys = sys.astype(self.dtype)
+        with Timer() as tm:
+            X = self._warm(sys)
+            X = supernode_init(sys, X, known=(~sys.is_new) if self.known_init else None)
+            ops = FrontierOps(sys.W, self.C, self.group)
+            frontier = xp.flatnonzero(sys.seed).astype(xp.int32)
+            while frontier.shape[0] > 0 and st.iters < self.max_iter:
+                Y, ch = ops.jacobi(frontier, X, sys.rhs, sys.diag, self.delta)
+                st.iters += 1
+                upd = frontier[ch]
+                if upd.shape[0] == 0:
+                    break
+                X[upd] = Y[ch]
+                mark = xp.zeros(sys.n_u, dtype=xp.uint8)
+                mark[upd] = 1
+                ops.mark_neighbors(upd, mark)
+                frontier = xp.flatnonzero(mark).astype(xp.int32)
+            self._store(sys, X)
+        st.edges = int(ops.edges)
+        st.ms = tm.ms
+        return st
+
+
+class DynLPPlus(Solver):
+    """Certified DynLP+: guarantees ||F - F*||_inf <= tol on every batch."""
+
+    def __init__(self, n_total, K, dtype="float32", method="auto", tol=1e-3, eps_h=0.05,
+                 group="auto", push_frac=0.05, push_budget=30.0, amg_hmax=2000.0,
+                 max_iter=100_000, amg_opts=None):
+        # float64 master copy of F and h; the solves run in `dtype`
+        super().__init__(n_total, K, dtype, store_dtype="float64")
+        self.method, self.tol, self.eps_h = method, tol, eps_h
+        self.group, self.push_frac, self.push_budget = group, push_frac, push_budget
+        self.amg_hmax = amg_hmax  # auto: use AMG only when the problem is hard (large h)
+        self.max_iter, self.amg_opts = max_iter, amg_opts or {}
+        self.name = f"dynlp+{method}"
+        self.H, self.hmax = None, None
+
+    def _amg(self, sys, st):
+        with Timer() as t:
+            amg = AMG(sys.W, sys.s, **self.amg_opts)
+        st.setup_ms += t.ms
+        st.edges += 10 * sys.nnz  # rough setup cost: matching rounds + Galerkin
+        return amg
+
+    def _use_amg(self):
+        if self.method == "amg":
+            return True
+        if self.method == "auto":
+            return (self.hmax or float("inf")) > self.amg_hmax
+        return False
+
+    def _precond(self, sys, st, amg_box):
+        if not self._use_amg():
+            return (lambda R: R / sys.diag[:, None]), 0
+        if amg_box[0] is None:
+            amg_box[0] = self._amg(sys, st)
+        return amg_box[0], amg_box[0].work_per_apply
+
+    def _run(self, sys, Z, rhs, eps, ops, st, amg_box):
+        xp = backend.get().xp
+        if self.method in ("push", "auto"):
+            R = rhs - apply_A(sys, Z)
+            st.edges += sys.nnz
+            if self.method == "auto":
+                frac = float((xp.abs(R) > xp.asarray(eps, dtype=Z.dtype)[None, :] * sys.diag[:, None])
+                             .any(axis=1).mean()) if sys.n_u else 0.0
+                if frac > self.push_frac:
+                    st.path = "amg" if self._use_amg() else "pcg"
+                    M, wm = self._precond(sys, st, amg_box)
+                    return pcg(sys, Z, rhs, eps, M, self.max_iter, st, wm)
+            budget = None if self.method == "push" else self.push_budget * max(sys.nnz, 1)
+            Z, R, ok = push(sys, Z, R, eps, ops, st, budget)
+            st.path = "push"
+            if ok:
+                return Z
+            if self.method == "push":  # push stalled (slow global mixing): finish with Jacobi-PCG
+                st.path = "push+pcg"
+                return pcg(sys, Z, rhs, eps, lambda R_: R_ / sys.diag[:, None], self.max_iter, st, 0)
+            st.path = "push+amg" if self._use_amg() else "push+pcg"
+        else:
+            st.path = self.method
+        M, wm = self._precond(sys, st, amg_box)
+        return pcg(sys, Z, rhs, eps, M, self.max_iter, st, wm)
+
+    def _floor(self, scale=1.0):
+        """Smallest residual ratio the working precision resolves for values of size `scale`."""
+        u = 1e-7 if self.dtype == np.float32 else 2e-16
+        return min(0.5, max(20 * u, 10 * u * scale))
+
+    def solve(self, sys):
+        xp = backend.get().xp
+        st = Stats()
+        sw = sys.astype(self.dtype)       # working precision
+        s64 = sys.astype(np.float64)      # certification precision
+        C, tol = self.C, self.tol
+        with Timer() as tm:
+            X = self._warm(sw)
+            if self.H is None:
+                self.H = xp.zeros((self.n_total, 1), dtype=self.store_dtype)
+            known = ~sw.is_new
+            X = supernode_init(sw, X, known)
+            Hc = init_h(sw, self.H[sw.U].astype(self.dtype), known, self.hmax or 1.0)
+            Z = xp.ascontiguousarray(xp.concatenate([X, Hc], axis=1))
+            rhs = xp.ascontiguousarray(xp.concatenate([sw.rhs, sw.diag[:, None]], axis=1))
+            ops = FrontierOps(sw.W, C + 1, self.group)
+            amg_box = [None]
+            hmax = self.hmax
+            if hmax is None and sw.n_u:  # first batch: get h before choosing the label tolerance
+                M, wm = self._precond(sw, st, amg_box) if self.method == "amg" else                     ((lambda R: R / sw.diag[:, None]), 0)
+                Z[:, C:] = pcg(sw, Z[:, C:].copy(), rhs[:, C:], [self.eps_h], M, self.max_iter, st, wm)
+                hmax = float(Z[:, C].max()) / (1 - self.eps_h)
+            hmax = hmax or 1.0
+            self.hmax = hmax  # lets `auto` pick its global solver by difficulty
+            eps = [max(tol / (1.25 * hmax), self._floor())] * C + [max(self.eps_h, self._floor(hmax))]
+            Z = self._run(sw, Z, rhs, eps, ops, st, amg_box)
+
+            # Certify in float64. If the working precision could not reach the
+            # target, refine: solve A D = R (scaled) in working precision, Z += D.
+            Z64 = Z.astype(np.float64)
+            rhs64 = xp.concatenate([s64.rhs, s64.diag[:, None]], axis=1)
+            bound = 0.0
+            for _ in range(10 if self.dtype == np.float32 else 2):
+                if sw.n_u == 0:
+                    break
+                R64 = rhs64 - apply_A(s64, Z64)
+                st.edges += s64.nnz
+                rc = rho_cols(s64, R64)
+                h_est = float(Z64[:, C].max())
+                h_ok = rc[C] <= self.eps_h
+                hmax = h_est / (1 - rc[C]) if h_ok else h_est
+                bound = float(rc[:C].max()) * hmax if h_ok else float("inf")
+                if bound <= tol:
+                    break
+                target = np.array([tol / (1.25 * hmax)] * C + [self.eps_h])
+                scale = np.where(rc > 0, rc, 1.0)
+                eps_c = np.clip(target / scale, self._floor(h_est), 1.0)
+                Rs = xp.ascontiguousarray((R64 / xp.asarray(scale)[None, :]).astype(self.dtype))
+                D = xp.zeros_like(Rs)
+                D = self._run(sw, D, Rs, list(eps_c), ops, st, amg_box)
+                Z64 += D.astype(np.float64) * xp.asarray(scale)[None, :]
+            st.cert, st.hmax = bound, hmax
+            self._store(sw, Z64[:, :C])
+            self.H[sw.U] = Z64[:, C:]
+            self.hmax = hmax
+        st.edges += int(ops.edges)
+        st.ms = tm.ms
+        return st
+
+
+class Reference:
+    """High-accuracy float64 solution F* and absorption bound (for metrics only)."""
+
+    def __init__(self, n_total, K, tol=1e-8):
+        self.inner = DynLPPlus(n_total, K, "float64", method="amg", tol=tol, eps_h=1e-6,
+                               max_iter=100_000)
+
+    def solve(self, sys):
+        st = self.inner.solve(sys)
+        return self.inner.scores(sys), self.inner.hmax, st
+
+
+def make(name, n_total, K, *, dtype, delta, tol, group, max_iter=None):
+    kw = {}
+    if max_iter is not None:
+        kw["max_iter"] = max_iter
+    if name == "itlp":
+        return ItLP(n_total, K, dtype, delta, **kw)
+    if name == "itlp-warm":
+        return ItLP(n_total, K, dtype, delta, warm=True, **kw)
+    if name == "dynlp":
+        return DynLP(n_total, K, dtype, delta, group, **kw)
+    if name == "dynlp-knowninit":
+        return DynLP(n_total, K, dtype, delta, group, known_init=True, **kw)
+    if name.startswith("dynlp+"):
+        return DynLPPlus(n_total, K, dtype, method=name.split("+", 1)[1], tol=tol, group=group, **kw)
+    raise ValueError(f"unknown solver {name!r}")
+
+
+SOLVERS = ["itlp", "itlp-warm", "dynlp", "dynlp-knowninit",
+           "dynlp+push", "dynlp+pcg", "dynlp+amg", "dynlp+auto"]
