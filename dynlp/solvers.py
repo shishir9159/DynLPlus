@@ -439,6 +439,126 @@ class DynLPPlus(Solver):
         return st
 
 
+class IncrementalLP(DynLPPlus):
+    """Certified DynLP+ with resident state (needs an IncrementalStream system).
+
+    Keeps Z = [F, h] and its float64 residual R between batches:
+      - a batch refreshes R only on the rows whose equation changed (sys.changed);
+      - small changes are repaired by the fused asynchronous push, in float64, on
+        the GPU (kernels.FusedPush), or by the vectorized push on CPU;
+      - the certificate is read off the maintained residual (an O(n) scan) instead
+        of a fresh full residual;
+      - large changes (and the first batch) go through DynLP+ and re-initialize R.
+    R is recomputed in full every `full_every` batches to bound rounding drift.
+    """
+
+    def __init__(self, n_total, K, dtype="float32", tol=1e-3, full_every=16, max_rounds=50_000, **kw):
+        super().__init__(n_total, K, dtype, method="auto", tol=tol, **kw)
+        self.name = "dynlp+inc"
+        self.full_every, self.max_rounds = full_every, max_rounds
+        self.Z = self.R = None
+        self.since_full = 0
+        self._fused = None
+
+    def _rhs64(self, s64):
+        xp = backend.get().xp
+        return xp.concatenate([s64.rhs, s64.diag[:, None]], axis=1)
+
+    def _reset_state(self, s64, st):
+        """Adopt DynLP+'s solution as the resident state and compute its residual in full."""
+        xp = backend.get().xp
+        Z = xp.ascontiguousarray(xp.concatenate([self.F, self.H], axis=1).astype(xp.float64))
+        Z[~s64.solved] = 0
+        self.Z = Z
+        self.R = xp.ascontiguousarray(self._rhs64(s64) - apply_A(s64, Z))
+        st.edges += s64.nnz
+        self.since_full = 0
+
+    def _push(self, s64, eps, st):
+        """Repair the violating rows of R; returns True when every row satisfies eps."""
+        B = backend.get()
+        xp = B.xp
+        Z, R = self.Z, self.R
+        eps_d = xp.asarray(eps, dtype=xp.float64)
+        viol = (xp.abs(R) > eps_d[None, :] * s64.diag[:, None]).any(axis=1)
+        cand = xp.flatnonzero(viol).astype(xp.int32)
+        if B.is_gpu and Z.shape[1] <= 32:
+            if self._fused is None or self._fused.W is not s64.W:
+                from .kernels import FusedPush
+                self._fused = FusedPush(s64.W, Z.shape[1], self.group)
+            rounds, ok, edges = self._fused.run(Z, R, s64.diag, eps_d, cand, self.max_rounds)
+            st.iters += rounds
+            st.edges += edges
+            return ok
+        ops = FrontierOps(s64.W, Z.shape[1], self.group)
+        _, _, ok = push(s64, Z, R, eps, ops, st, max_iter=self.max_rounds)
+        st.edges += int(ops.edges)
+        return ok
+
+    def solve(self, sys):
+        xp = backend.get().xp
+        if sys.solved is None:
+            raise ValueError("dynlp+inc needs an IncrementalStream system (bench --incremental)")
+        s64 = sys.astype(np.float64)
+        C, tol = self.C, self.tol
+        st = Stats(path="inc-push")
+        with Timer() as tm:
+            small = self.Z is not None
+            if small:
+                Z, R = self.Z, self.R
+                out = ~s64.solved
+                Z[out] = 0
+                R[out] = 0
+                known = s64.solved & ~s64.is_new
+                supernode_init(s64, Z[:, :C], known)
+                init_h(s64, Z[:, C:], known, self.hmax)
+                Q = s64.changed
+                if Q.shape[0]:
+                    WQ = s64.W[Q]
+                    R[Q] = self._rhs64(s64)[Q] - s64.diag[Q][:, None] * Z[Q] + spmm(WQ, Z)
+                    st.edges += int(WQ.nnz)
+                self.since_full += 1
+                if self.since_full >= self.full_every:  # bound rounding drift in the kept residual
+                    self.R = R = xp.ascontiguousarray(self._rhs64(s64) - apply_A(s64, Z))
+                    st.edges += s64.nnz
+                    self.since_full = 0
+                hmax = self.hmax or 1.0
+                eps = [tol / (1.25 * hmax)] * C + [self.eps_h]
+                eps_d = xp.asarray(eps)
+                frac = float((xp.abs(R) > eps_d[None, :] * s64.diag[:, None]).any(axis=1).sum()) \
+                    / max(s64.n_solved, 1)
+                small = frac <= self.push_frac
+            if small:
+                bound = float("inf")
+                for _ in range(4):
+                    ok = self._push(s64, eps, st)
+                    rc = rho_cols(s64, self.R)
+                    h_est = float(self.Z[:, C].max())
+                    h_ok = rc[C] <= self.eps_h
+                    hmax = h_est / (1 - rc[C]) if h_ok else h_est
+                    bound = float(rc[:C].max()) * hmax if h_ok else float("inf")
+                    if ok and bound <= tol:
+                        break
+                    eps = [tol / (1.25 * hmax)] * C + [self.eps_h]
+                small = bound <= tol
+                st.cert, st.hmax = bound, hmax
+                self.hmax = hmax
+            if not small:  # first or large batch, or push did not certify: global solve
+                if self.Z is not None:
+                    self.F = self.Z[:, :C].copy()
+                    self.H = self.Z[:, C:].copy()
+                inner = DynLPPlus.solve(self, sys)
+                st.iters += inner.iters
+                st.edges += inner.edges
+                st.setup_ms += inner.setup_ms
+                st.cert, st.hmax, st.path = inner.cert, inner.hmax, "inc-" + inner.path
+                self._reset_state(s64, st)
+            self.F = self.Z[:, :C]
+            self.H = self.Z[:, C:]
+        st.ms = tm.ms
+        return st
+
+
 class Reference:
     """High-accuracy float64 solution F* and absorption bound (for metrics only)."""
 
@@ -463,10 +583,12 @@ def make(name, n_total, K, *, dtype, delta, tol, group, max_iter=None):
         return DynLP(n_total, K, dtype, delta, group, **kw)
     if name == "dynlp-knowninit":
         return DynLP(n_total, K, dtype, delta, group, known_init=True, **kw)
+    if name == "dynlp+inc":
+        return IncrementalLP(n_total, K, dtype, tol=tol, group=group, **kw)
     if name.startswith("dynlp+"):
         return DynLPPlus(n_total, K, dtype, method=name.split("+", 1)[1], tol=tol, group=group, **kw)
     raise ValueError(f"unknown solver {name!r}")
 
 
 SOLVERS = ["itlp", "itlp-warm", "dynlp", "dynlp-knowninit",
-           "dynlp+push", "dynlp+pcg", "dynlp+amg", "dynlp+auto"]
+           "dynlp+push", "dynlp+pcg", "dynlp+amg", "dynlp+auto", "dynlp+inc"]
