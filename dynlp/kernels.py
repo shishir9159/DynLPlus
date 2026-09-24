@@ -140,6 +140,90 @@ extern "C" __global__ void mark_neighbors(
 }}
 """
 
+# Fused, asynchronous push: two kernels per round, no host sync per round.
+# Round r reads frontier slot p = r & 1 and writes the next frontier into slot 1 - p;
+# each kernel resets the counter the *other* kernel appends to next, so no extra
+# launches are needed. The residual is read-and-zeroed atomically (atomicExch), so
+# pushes from neighbours that land during the round are kept for the next one.
+_FUSED_SRC = r"""
+#define GS {GS}
+#define NC {NC}
+typedef {REAL} real;
+
+__device__ __forceinline__ real take_residual(real* p) {{
+#if {IS_DOUBLE}
+  return __longlong_as_double((long long)atomicExch((unsigned long long*)p, 0ull));
+#else
+  return atomicExch(p, 0.0f);
+#endif
+}}
+
+extern "C" __global__ void push_round(
+    const int* __restrict__ indptr, const int* __restrict__ indices, const real* __restrict__ w,
+    const real* __restrict__ diag, const int* __restrict__ frontier, const int* __restrict__ fcount,
+    int* __restrict__ fcount_next, real* __restrict__ Z, real* __restrict__ R,
+    int* __restrict__ mark, int* __restrict__ touched, int* __restrict__ tcount,
+    unsigned long long* __restrict__ edges)
+{{
+  const int nf = *fcount;
+  if (blockIdx.x == 0 && threadIdx.x == 0) *fcount_next = 0;
+  const int lane_w = threadIdx.x & 31;
+  const int lane = lane_w % GS;
+  const long long gpw = 32 / GS;
+  const long long warp = ((long long)blockIdx.x * blockDim.x + threadIdx.x) >> 5;
+  const long long stride = (((long long)gridDim.x * blockDim.x) >> 5) * gpw;
+  for (long long g0 = warp * gpw; g0 < nf; g0 += stride) {{     // warp-uniform loop
+    const long long g = g0 + lane_w / GS;
+    const bool valid = g < nf;
+    const int u = valid ? frontier[g] : 0;
+    real d[NC];
+    #pragma unroll
+    for (int c = 0; c < NC; ++c) d[c] = 0;
+    if (valid && lane == 0) {{
+      const real inv = (real)1 / diag[u];
+      #pragma unroll
+      for (int c = 0; c < NC; ++c) {{
+        d[c] = take_residual(&R[(long long)u * NC + c]) * inv;
+        Z[(long long)u * NC + c] += d[c];
+      }}
+    }}
+    #pragma unroll
+    for (int c = 0; c < NC; ++c) d[c] = __shfl_sync(0xffffffffu, d[c], 0, GS);
+    if (valid) {{
+      const int beg = indptr[u], end = indptr[u + 1];
+      if (lane == 0) atomicAdd(edges, (unsigned long long)(end - beg));
+      for (int j = beg + lane; j < end; j += GS) {{
+        const real wv = w[j];
+        if (wv == (real)0) continue;                 // inert entries (outside U)
+        const long long v = indices[j];
+        #pragma unroll
+        for (int c = 0; c < NC; ++c) atomicAdd(&R[v * NC + c], wv * d[c]);
+        if (atomicExch(&mark[v], 1) == 0) touched[atomicAdd(tcount, 1)] = (int)v;
+      }}
+    }}
+  }}
+}}
+
+extern "C" __global__ void compact_frontier(
+    const int* __restrict__ touched, const int* __restrict__ tcount, int* __restrict__ tcount_next,
+    int* __restrict__ mark, const real* __restrict__ R, const real* __restrict__ diag,
+    const real* __restrict__ eps, int* __restrict__ out, int* __restrict__ fcount_out)
+{{
+  const int nt = *tcount;
+  if (blockIdx.x == 0 && threadIdx.x == 0) *tcount_next = 0;
+  for (long long i = (long long)blockIdx.x * blockDim.x + threadIdx.x; i < nt;
+       i += (long long)gridDim.x * blockDim.x) {{
+    const int v = touched[i];
+    mark[v] = 0;
+    const real dv = diag[v];
+    bool viol = false;
+    #pragma unroll
+    for (int c = 0; c < NC; ++c) viol |= fabs(R[(long long)v * NC + c]) > eps[c] * dv;
+    if (viol) out[atomicAdd(fcount_out, 1)] = v;
+  }}
+}}
+"""
+
 _MODULES: dict = {}
 MAX_KERNEL_COLS = 32
 
@@ -153,6 +237,68 @@ def _module(gs, nc, real):
     return _MODULES[key]
 
 
+class FusedPush:
+    """Asynchronous residual push with resident buffers (GPU only, C <= 32).
+
+    Solves A z = rhs in place given z and its residual r: repeatedly takes the
+    residual of every violating vertex (|r_u| > eps_c * diag_u), adds r_u / diag_u
+    to z_u, and scatters it to the neighbours. Converges for this M-matrix even
+    with the asynchronous updates (chaotic relaxation).
+    """
+
+    def __init__(self, W, C, group="auto", threads=256, blocks_per_sm=8):
+        import cupy
+        n = W.shape[0]
+        self.W, self.C, self.n = W, C, n
+        avg = W.nnz / max(n, 1)
+        self.gs = min(auto_group(avg) if group == "auto" else int(group), 32)
+        double = W.data.dtype == np.float64
+        key = ("fused", self.gs, C, double)
+        if key not in _MODULES:
+            src = _FUSED_SRC.format(GS=self.gs, NC=C, REAL="double" if double else "float",
+                                    IS_DOUBLE=1 if double else 0)
+            _MODULES[key] = cupy.RawModule(code=src, options=("--std=c++14",))
+        mod = _MODULES[key]
+        self.k_push = mod.get_function("push_round")
+        self.k_compact = mod.get_function("compact_frontier")
+        self.front = cupy.empty((2, n), dtype=cupy.int32)
+        self.touched = cupy.empty(n, dtype=cupy.int32)
+        self.mark = cupy.zeros(n, dtype=cupy.int32)
+        self.fcnt = cupy.zeros(2, dtype=cupy.int32)
+        self.tcnt = cupy.zeros(2, dtype=cupy.int32)
+        self.edges = cupy.zeros(1, dtype=cupy.uint64)
+        sms = cupy.cuda.Device().attributes["MultiProcessorCount"]
+        self.grid, self.threads = sms * blocks_per_sm, threads
+
+    def run(self, Z, R, diag, eps, cand, max_rounds, check_every=8):
+        """Push until no vertex violates; returns (rounds, converged, edge visits)."""
+        import cupy
+        n0 = int(cand.shape[0])
+        self.edges[:] = 0
+        if n0 == 0:
+            return 0, True, 0
+        W = self.W
+        self.front[0, :n0] = cand
+        self.fcnt[0] = n0
+        self.fcnt[1] = 0
+        self.tcnt[:] = 0
+        eps = cupy.ascontiguousarray(eps, dtype=Z.dtype)
+        rounds, converged = 0, False
+        g, b = (self.grid,), (self.threads,)
+        while rounds < max_rounds:
+            p, q = rounds & 1, 1 - (rounds & 1)
+            self.k_push(g, b, (W.indptr, W.indices, W.data, diag, self.front[p], self.fcnt[p:p + 1],
+                               self.fcnt[q:q + 1], Z, R, self.mark, self.touched, self.tcnt[p:p + 1],
+                               self.edges))
+            self.k_compact(g, b, (self.touched, self.tcnt[p:p + 1], self.tcnt[q:q + 1], self.mark, R, diag,
+                                  eps, self.front[q], self.fcnt[q:q + 1]))
+            rounds += 1
+            if rounds % check_every == 0 and int(self.fcnt[q]) == 0:
+                converged = True
+                break
+        if not converged:
+            converged = int(self.fcnt[rounds & 1]) == 0
+        return rounds, converged, int(self.edges[0])
 
 
 def auto_group(avg_deg: float) -> int:
