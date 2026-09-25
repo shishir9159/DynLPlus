@@ -1,0 +1,69 @@
+[env] {"backend": "cupy", "python": "3.12.13", "gpu": "NVIDIA GeForce GTX 1650 SUPER", "cc": "7.5", "mem_gb": 4.3, "cupy": "14.2.0", "cuda_runtime": 13020}
+[data] sbm-n300000-K2-d10: n=300,000 nnz=2,999,900 K=2 (0.6s, gpu mem 0.0 GB)
+[batch   0] active=30,000 |U|=3,558 nnz(W)=6,496 +30,000 -0 comps=1,955 ungrounded=26,143 build=24ms ref=269ms max(h)=5.55e+03
+    itlp                1538.9 ms  iters=4312    sweeps=  4312.0 err=1.97e-01 bound=5.55e-01 agree=0.9994 acc=0.7555 jacobi
+    itlp-warm           4881.5 ms  iters=10517   sweeps= 10517.0 err=4.01e-02 bound=5.55e-01 agree=1.0000 acc=0.7549 jacobi
+    dynlp               5325.6 ms  iters=3116    sweeps=  2046.5 err=3.24e-01 bound=5.55e-01 agree=0.9994 acc=0.7555 frontier-jacobi
+    dynlp-knowninit     5773.7 ms  iters=3116    sweeps=  2046.5 err=3.24e-01 bound=5.55e-01 agree=0.9994 acc=0.7555 frontier-jacobi
+    dynlp+push         31483.0 ms  iters=19056   sweeps=  6116.1 err=2.05e-05 bound=7.99e-04 agree=1.0000 acc=0.7549 push+pcg
+    dynlp+pcg           1105.6 ms  iters=807     sweeps=   816.0 err=2.34e-05 bound=7.82e-04 agree=1.0000 acc=0.7549 pcg
+    dynlp+amg            208.9 ms  iters=44      sweeps=  3284.3 err=1.88e-06 bound=7.32e-04 agree=1.0000 acc=0.7549 amg
+    dynlp+auto           542.0 ms  iters=337     sweeps=  2407.6 err=1.88e-06 bound=7.32e-04 agree=1.0000 acc=0.7549 amg
+[batch   1] active=78,600 |U|=70,456 nnz(W)=199,690 +54,000 -5,400 comps=21,756 ungrounded=7,318 build=41ms ref=439ms max(h)=291
+    itlp                 192.1 ms  iters=407     sweeps=   407.0 err=7.24e-03 bound=2.89e-02 agree=0.9776 acc=0.8672 jacobi
+    itlp-warm            245.6 ms  iters=506     sweeps=   506.0 err=2.11e-03 bound=2.90e-02 agree=0.9941 acc=0.8537 jacobi
+    dynlp                852.1 ms  iters=406     sweeps=   162.0 err=7.25e-03 bound=2.91e-02 agree=0.9966 acc=0.8484 frontier-jacobi
+    dynlp-knowninit      803.4 ms  iters=408     sweeps=   140.3 err=7.62e-03 bound=2.91e-02 agree=0.9926 acc=0.8548 frontier-jacobi
+    dynlp+push          2743.0 ms  iters=1521    sweeps=  1059.6 err=5.96e-05 bound=6.86e-04 agree=0.9996 acc=0.8492 push
+    dynlp+pcg            101.7 ms  iters=83      sweeps=    86.0 err=4.94e-05 bound=5.04e-04 agree=1.0000 acc=0.8488 pcg
+    dynlp+amg            241.0 ms  iters=24      sweeps=   160.1 err=5.99e-05 bound=5.38e-04 agree=1.0000 acc=0.8488 amg
+    dynlp+auto           201.5 ms  iters=24      sweeps=   161.1 err=5.99e-05 bound=5.38e-04 agree=1.0000 acc=0.8488 amg
+[batch   2] active=127,200 |U|=123,958 nnz(W)=526,792 +54,000 -5,400 comps=28,222 ungrounded=1,877 build=31ms ref=312ms max(h)=160
+    itlp                  57.6 ms  iters=148     sweeps=   148.0 err=1.25e-02 bound=1.58e-02 agree=0.9568 acc=0.9518 jacobi
+    itlp-warm             39.8 ms  iters=93      sweeps=    93.0 err=1.60e-03 bound=1.46e-02 agree=0.9962 acc=0.9151 jacobi
+    dynlp                232.2 ms  iters=162     sweeps=   134.9 err=5.68e-03 bound=1.60e-02 agree=0.9766 acc=0.9337 frontier-jacobi
+    dynlp-knowninit      128.0 ms  iters=95      sweeps=    47.7 err=3.31e-03 bound=1.60e-02 agree=0.9883 acc=0.9228 frontier-jacobi
+    dynlp+push          1110.8 ms  iters=664     sweeps=   338.4 err=2.58e-05 bound=2.52e-04 agree=0.9999 acc=0.9116 push
+    dynlp+pcg             71.3 ms  iters=47      sweeps=    50.0 err=3.21e-05 bound=3.95e-04 agree=1.0000 acc=0.9115 pcg
+    dynlp+amg            225.3 ms  iters=19      sweeps=   128.3 err=4.48e-05 bound=3.34e-04 agree=1.0000 acc=0.9115 amg
+    dynlp+auto            53.9 ms  iters=47      sweeps=    51.0 err=3.20e-05 bound=3.72e-04 agree=1.0000 acc=0.9115 pcg
+[batch   3] active=175,800 |U|=173,374 nnz(W)=1,007,258 +54,000 -5,400 comps=29,368 ungrounded=517 build=39ms ref=420ms max(h)=129
+    itlp                  38.2 ms  iters=110     sweeps=   110.0 err=1.15e-02 bound=1.27e-02 agree=0.9752 acc=0.9804 jacobi
+    itlp-warm             18.9 ms  iters=51      sweeps=    51.0 err=2.49e-03 bound=1.15e-02 agree=0.9910 acc=0.9478 jacobi
+    dynlp                271.8 ms  iters=164     sweeps=   109.2 err=4.32e-03 bound=1.29e-02 agree=0.9883 acc=0.9680 frontier-jacobi
+    dynlp-knowninit      219.8 ms  iters=149     sweeps=    41.3 err=2.85e-03 bound=1.29e-02 agree=0.9942 acc=0.9510 frontier-jacobi
+    dynlp+push          1503.2 ms  iters=571     sweeps=   264.9 err=3.16e-04 bound=7.13e-04 agree=0.9988 acc=0.9554 push
+    dynlp+pcg             54.8 ms  iters=33      sweeps=    36.0 err=1.30e-05 bound=3.90e-04 agree=1.0000 acc=0.9566 pcg
+    dynlp+amg            379.0 ms  iters=11      sweeps=    81.6 err=1.85e-05 bound=3.92e-04 agree=1.0000 acc=0.9566 amg
+    dynlp+auto            61.9 ms  iters=33      sweeps=    37.0 err=1.30e-05 bound=3.82e-04 agree=1.0000 acc=0.9566 pcg
+[batch   4] active=224,400 |U|=221,812 nnz(W)=1,640,964 +54,000 -5,400 comps=29,657 ungrounded=128 build=43ms ref=739ms max(h)=118
+    itlp                  41.0 ms  iters=88      sweeps=    88.0 err=1.03e-02 bound=1.14e-02 agree=0.9902 acc=0.9916 jacobi
+    itlp-warm             15.3 ms  iters=22      sweeps=    22.0 err=6.66e-03 bound=1.02e-02 agree=0.9854 acc=0.9686 jacobi
+    dynlp                282.3 ms  iters=119     sweeps=    95.8 err=2.60e-03 bound=1.18e-02 agree=0.9968 acc=0.9860 frontier-jacobi
+    dynlp-knowninit      272.4 ms  iters=138     sweeps=    51.1 err=6.03e-03 bound=1.18e-02 agree=0.9867 acc=0.9698 frontier-jacobi
+    dynlp+push          2304.7 ms  iters=713     sweeps=   269.3 err=3.71e-04 bound=8.10e-04 agree=0.9995 acc=0.9823 push
+    dynlp+pcg             67.9 ms  iters=25      sweeps=    28.0 err=8.59e-06 bound=3.14e-04 agree=1.0000 acc=0.9829 pcg
+    dynlp+amg            637.1 ms  iters=9       sweeps=    70.0 err=6.72e-06 bound=2.15e-04 agree=1.0000 acc=0.9829 amg
+    dynlp+auto            58.9 ms  iters=25      sweeps=    29.0 err=8.71e-06 bound=3.26e-04 agree=1.0000 acc=0.9829 pcg
+[batch   5] active=273,000 |U|=269,971 nnz(W)=2,430,680 +54,000 -5,400 comps=29,834 ungrounded=29 build=47ms ref=1116ms max(h)=110
+    itlp                  44.3 ms  iters=74      sweeps=    74.0 err=9.01e-03 bound=1.06e-02 agree=0.9965 acc=0.9959 jacobi
+    itlp-warm             13.1 ms  iters=18      sweeps=    18.0 err=9.17e-03 bound=1.05e-02 agree=0.9894 acc=0.9829 jacobi
+    dynlp                200.3 ms  iters=104     sweeps=    91.1 err=1.67e-03 bound=1.10e-02 agree=0.9993 acc=0.9939 frontier-jacobi
+    dynlp-knowninit      826.3 ms  iters=471     sweeps=   164.3 err=5.82e-03 bound=1.10e-02 agree=0.9949 acc=0.9883 frontier-jacobi
+    dynlp+push          2187.4 ms  iters=647     sweeps=   230.6 err=3.90e-04 bound=8.28e-04 agree=0.9998 acc=0.9930 push
+    dynlp+pcg             78.3 ms  iters=21      sweeps=    24.0 err=7.25e-06 bound=3.15e-04 agree=1.0000 acc=0.9932 pcg
+    dynlp+amg           1073.5 ms  iters=7       sweeps=    58.0 err=6.11e-06 bound=2.42e-04 agree=1.0000 acc=0.9932 amg
+    dynlp+auto            77.3 ms  iters=21      sweeps=    25.0 err=7.30e-06 bound=3.08e-04 agree=1.0000 acc=0.9932 pcg
+
+summary (all batches)
+solver             total ms    sweeps    iters   max err  max bound min agree     acc
+-------------------------------------------------------------------------------------
+itlp                 1912.1    5139.0     5139  1.97e-01   5.55e-01    0.9568  0.9237
+itlp-warm            5214.2   11207.0    11207  4.01e-02   5.55e-01    0.9854  0.9038
+dynlp                7164.3    2639.4     4071  3.24e-01   5.55e-01    0.9766  0.9142
+dynlp-knowninit      8023.5    2491.1     4377  3.24e-01   5.55e-01    0.9867  0.9070
+dynlp+push          41332.1    8279.0    23172  3.90e-04   8.28e-04    0.9988  0.9077
+dynlp+pcg            1479.7    1040.0     1016  4.94e-05   7.82e-04    1.0000  0.9080
+dynlp+amg            2764.7    3782.3      114  5.99e-05   7.32e-04    1.0000  0.9080
+dynlp+auto            995.5    2710.6      487  5.99e-05   7.32e-04    1.0000  0.9080
+[out] 48 rows -> results/local_sbm300k.csv
