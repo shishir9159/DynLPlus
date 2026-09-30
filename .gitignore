@@ -5,6 +5,7 @@
 !/.python-version
 !/pyproject.toml
 !/uv.lock
+!/justfile
 !/dynlp/*.py
 !/tests/*.py
 !/scripts/*
