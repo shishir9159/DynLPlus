@@ -2,7 +2,6 @@
 
 Compares lanes-per-row mappings for the frontier Jacobi kernel, including
 DynLP's one-block-per-row mapping (group=128/256), against a full cuSPARSE SpMM.
-This tests the paper's kernel design (Obs. 5 in paper_summary.md).
 
   python -m dynlp.kernelbench --dataset sbm --n 10000000 --deg 10 --cols 1,2,8 --out results/kernels.csv
 """
@@ -20,26 +19,17 @@ from .kernels import FrontierOps
 
 def main(argv=None):
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("--dataset", default="sbm")
-    ap.add_argument("--n", type=int, default=1_000_000)
-    ap.add_argument("--classes", type=int, default=2)
-    ap.add_argument("--deg", type=float, default=10.0)
-    ap.add_argument("--dtype", default="float32")
-    ap.add_argument("--cols", default="1,2,8")
-    ap.add_argument("--fracs", default="0.001,0.01,0.1,1.0", help="frontier size / n")
-    ap.add_argument("--groups", default="1,2,4,8,16,32,128")
-    ap.add_argument("--reps", type=int, default=20)
-    ap.add_argument("--seed", type=int, default=0)
-    ap.add_argument("--data-dir", default="data")
-    ap.add_argument("--out", default=None)
+    for flag, typ, default in [("--dataset", str, "sbm"), ("--n", int, 1_000_000), ("--classes", int, 2),
+                               ("--deg", float, 10.0), ("--dtype", str, "float32"), ("--cols", str, "1,2,8"),
+                               ("--fracs", str, "0.001,0.01,0.1,1.0"), ("--groups", str, "1,2,4,8,16,32,128"),
+                               ("--reps", int, 20), ("--seed", int, 0), ("--data-dir", str, "data"), ("--out", str, None)]:
+        ap.add_argument(flag, type=typ, default=default)
     a = ap.parse_args(argv)
 
     be = backend.set_backend("cupy")
     import cupy as cp
     ds = graphs.load(a.dataset, n=a.n, K=a.classes, deg=a.deg, seed=a.seed, dtype=a.dtype, data_dir=a.data_dir)
-    W = ds.A
-    n = W.shape[0]
-    real = np.dtype(a.dtype).itemsize
+    W, n, real = ds.A, ds.A.shape[0], np.dtype(a.dtype).itemsize
     deg = np.diff(be.asnumpy(W.indptr))
     print(f"[data] {ds.name}: n={n:,} nnz={W.nnz:,} mean deg={deg.mean():.1f} max deg={deg.max():,}")
     rs = cp.random.RandomState(a.seed)
@@ -56,8 +46,7 @@ def main(argv=None):
         return cp.cuda.get_elapsed_time(start, end) / a.reps
 
     for C in [int(c) for c in a.cols.split(",")]:
-        X = rs.random_sample((n, C)).astype(a.dtype)
-        rhs = rs.random_sample((n, C)).astype(a.dtype)
+        X, rhs = (rs.random_sample((n, C)).astype(a.dtype) for _ in range(2))
         diag = (W @ cp.ones(n, dtype=a.dtype) + 1).astype(a.dtype)
         full_ms = timeit(lambda: W @ X if C > 1 else W @ X[:, 0])
         bytes_full = W.nnz * (4 + real + C * real) + n * (4 + 2 * C * real)
