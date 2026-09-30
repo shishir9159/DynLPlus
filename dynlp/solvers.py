@@ -464,11 +464,16 @@ class IncrementalLP(DynLPPlus):
         xp = backend.get().xp
         return xp.concatenate([s64.rhs, s64.diag[:, None]], axis=1)
 
+    def _park(self, Z, out):
+        """Exact values of inert rows (diag 1, rhs 0; h's rhs is diag): F = 0, h = 1."""
+        Z[out, :self.C] = 0
+        Z[out, self.C] = 1
+
     def _reset_state(self, s64, st):
         """Adopt DynLP+'s solution as the resident state and compute its residual in full."""
         xp = backend.get().xp
         Z = xp.ascontiguousarray(xp.concatenate([self.F, self.H], axis=1).astype(xp.float64))
-        Z[~s64.solved] = 0
+        self._park(Z, ~s64.solved)
         self.Z = Z
         self.R = xp.ascontiguousarray(self._rhs64(s64) - apply_A(s64, Z))
         st.edges += s64.nnz
@@ -507,7 +512,7 @@ class IncrementalLP(DynLPPlus):
             if small:
                 Z, R = self.Z, self.R
                 out = ~s64.solved
-                Z[out] = 0
+                self._park(Z, out)
                 R[out] = 0
                 known = s64.solved & ~s64.is_new
                 supernode_init(s64, Z[:, :C], known)

@@ -72,7 +72,7 @@ def test_incremental_solver_is_certified_on_small_batches(be, K):
     tol = 1e-3
     ds = graphs.sbm(3000, K=K, deg=6.0, seed=6, dtype="float32")
     st = IncrementalStream(ds, init_frac=0.85, n_batches=8, del_frac=0.1, label_frac=0.02, dtype="float32")
-    solver = IncrementalLP(ds.n, K, "float32", tol=tol, full_every=4)
+    solver = IncrementalLP(ds.n, K, "float32", tol=tol, full_every=4, push_frac=0.5)  # small graph: each batch touches ~12% of rows
     paths = []
     for sys in st.batches():
         stats = solver.solve(sys)
