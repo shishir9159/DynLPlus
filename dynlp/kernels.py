@@ -224,81 +224,16 @@ extern "C" __global__ void compact_frontier(
 }}
 """
 
-_MODULES: dict = {}
 MAX_KERNEL_COLS = 32
+_MODULES: dict = {}
 
 
-def _module(gs, nc, real):
-    key = (gs, nc, real)
+def _module(src, **fmt):
+    key = (src is _FUSED_SRC,) + tuple(sorted(fmt.items()))
     if key not in _MODULES:
         import cupy
-        src = _SRC.format(GS=gs, NC=nc, REAL=real)
-        _MODULES[key] = cupy.RawModule(code=src, options=("--std=c++14",))
+        _MODULES[key] = cupy.RawModule(code=src.format(**fmt), options=("--std=c++14",))
     return _MODULES[key]
-
-
-class FusedPush:
-    """Asynchronous residual push with resident buffers (GPU only, C <= 32).
-
-    Solves A z = rhs in place given z and its residual r: repeatedly takes the
-    residual of every violating vertex (|r_u| > eps_c * diag_u), adds r_u / diag_u
-    to z_u, and scatters it to the neighbours. Converges for this M-matrix even
-    with the asynchronous updates (chaotic relaxation).
-    """
-
-    def __init__(self, W, C, group="auto", threads=256, blocks_per_sm=8):
-        import cupy
-        n = W.shape[0]
-        self.W, self.C, self.n = W, C, n
-        avg = W.nnz / max(n, 1)
-        self.gs = min(auto_group(avg) if group == "auto" else int(group), 32)
-        double = W.data.dtype == np.float64
-        key = ("fused", self.gs, C, double)
-        if key not in _MODULES:
-            src = _FUSED_SRC.format(GS=self.gs, NC=C, REAL="double" if double else "float",
-                                    IS_DOUBLE=1 if double else 0)
-            _MODULES[key] = cupy.RawModule(code=src, options=("--std=c++14",))
-        mod = _MODULES[key]
-        self.k_push = mod.get_function("push_round")
-        self.k_compact = mod.get_function("compact_frontier")
-        self.front = cupy.empty((2, n), dtype=cupy.int32)
-        self.touched = cupy.empty(n, dtype=cupy.int32)
-        self.mark = cupy.zeros(n, dtype=cupy.int32)
-        self.fcnt = cupy.zeros(2, dtype=cupy.int32)
-        self.tcnt = cupy.zeros(2, dtype=cupy.int32)
-        self.edges = cupy.zeros(1, dtype=cupy.uint64)
-        sms = cupy.cuda.Device().attributes["MultiProcessorCount"]
-        self.grid, self.threads = sms * blocks_per_sm, threads
-
-    def run(self, Z, R, diag, eps, cand, max_rounds, check_every=8):
-        """Push until no vertex violates; returns (rounds, converged, edge visits)."""
-        import cupy
-        n0 = int(cand.shape[0])
-        self.edges[:] = 0
-        if n0 == 0:
-            return 0, True, 0
-        W = self.W
-        self.front[0, :n0] = cand
-        self.fcnt[0] = n0
-        self.fcnt[1] = 0
-        self.tcnt[:] = 0
-        eps = cupy.ascontiguousarray(eps, dtype=Z.dtype)
-        rounds, converged = 0, False
-        g, b = (self.grid,), (self.threads,)
-        while rounds < max_rounds:
-            p, q = rounds & 1, 1 - (rounds & 1)
-            self.k_push(g, b, (W.indptr, W.indices, W.data, diag, self.front[p], self.fcnt[p:p + 1],
-                               self.fcnt[q:q + 1], Z, R, self.mark, self.touched, self.tcnt[p:p + 1],
-                               self.edges))
-            self.k_compact(g, b, (self.touched, self.tcnt[p:p + 1], self.tcnt[q:q + 1], self.mark, R, diag,
-                                  eps, self.front[q], self.fcnt[q:q + 1]))
-            rounds += 1
-            if rounds % check_every == 0 and int(self.fcnt[q]) == 0:
-                converged = True
-                break
-        if not converged:
-            converged = int(self.fcnt[rounds & 1]) == 0
-        return rounds, converged, int(self.edges[0])
 
 
 def auto_group(avg_deg: float) -> int:
@@ -309,80 +244,101 @@ def auto_group(avg_deg: float) -> int:
     return g
 
 
+def _group(W, group):
+    return auto_group(W.nnz / max(W.shape[0], 1)) if group == "auto" else int(group)
+
+
+class FusedPush:
+    """Asynchronous residual push with resident buffers (GPU, C <= 32).
+
+    Takes the residual of every violating vertex (|r_u| > eps_c * diag_u), adds
+    r_u / diag_u to z_u and scatters it to the neighbours, keeping r exact.
+    Converges for this M-matrix despite the asynchrony (chaotic relaxation).
+    """
+
+    def __init__(self, W, C, group="auto", threads=256, blocks_per_sm=8):
+        import cupy
+        n, double = W.shape[0], W.data.dtype == np.float64
+        self.W, self.C, self.gs = W, C, min(_group(W, group), 32)
+        mod = _module(_FUSED_SRC, GS=self.gs, NC=C, REAL="double" if double else "float", IS_DOUBLE=int(double))
+        self.k_push, self.k_compact = mod.get_function("push_round"), mod.get_function("compact_frontier")
+        z = lambda *s: cupy.zeros(s, dtype=cupy.int32)  # noqa: E731
+        self.front, self.touched, self.mark, self.fcnt, self.tcnt = z(2, n), z(n), z(n), z(2), z(2)
+        self.edges = cupy.zeros(1, dtype=cupy.uint64)
+        self.grid = (cupy.cuda.Device().attributes["MultiProcessorCount"] * blocks_per_sm,)
+        self.block = (threads,)
+
+    def run(self, Z, R, diag, eps, cand, max_rounds, check_every=8):
+        """Push until no vertex violates; returns (rounds, converged, edge visits)."""
+        import cupy
+        n0, W = int(cand.shape[0]), self.W
+        self.edges[:] = 0
+        if not n0:
+            return 0, True, 0
+        self.front[0, :n0], self.fcnt[:], self.tcnt[:] = cand, 0, 0
+        self.fcnt[0] = n0
+        eps, rounds = cupy.ascontiguousarray(eps, dtype=Z.dtype), 0
+        while rounds < max_rounds:
+            p, q = rounds & 1, 1 - (rounds & 1)
+            fp, fq, tp, tq = self.fcnt[p:p + 1], self.fcnt[q:q + 1], self.tcnt[p:p + 1], self.tcnt[q:q + 1]
+            self.k_push(self.grid, self.block, (W.indptr, W.indices, W.data, diag, self.front[p], fp, fq, Z, R,
+                                                self.mark, self.touched, tp, self.edges))
+            self.k_compact(self.grid, self.block, (self.touched, tp, tq, self.mark, R, diag, eps, self.front[q], fq))
+            rounds += 1
+            if rounds % check_every == 0 and int(self.fcnt[q]) == 0:
+                break
+        return rounds, int(self.fcnt[rounds & 1]) == 0, int(self.edges[0])
+
+
 class FrontierOps:
     """Frontier primitives bound to one CSR matrix and column count."""
 
     def __init__(self, W, C, group="auto", threads=256):
-        B = backend.get()
-        self.B, self.W, self.C = B, W, C
-        n = W.shape[0]
-        self.avg_deg = (W.nnz / n) if n else 0.0
-        self.gs = auto_group(self.avg_deg) if group == "auto" else int(group)
-        self.threads = threads
-        self.real = "double" if W.data.dtype == np.float64 else "float"
-        self.use_kernel = B.is_gpu and C <= MAX_KERNEL_COLS
-        self.edges = B.xp.zeros((), dtype=B.xp.int64)  # device-side edge-visit counter
+        self.B, self.W, self.C, self.threads = backend.get(), W, C, threads
+        self.gs = _group(W, group)
+        self.real = np.float64 if W.data.dtype == np.float64 else np.float32
+        self.use_kernel = self.B.is_gpu and C <= MAX_KERNEL_COLS
+        self.edges = self.B.xp.zeros((), dtype=self.B.xp.int64)  # device-side edge-visit counter
 
-    # ---------------------------------------------------------------- utils
-    def _launch(self, name, ngroups, args):
-        mod = _module(self.gs, self.C, self.real)
-        k = mod.get_function(name)
-        if self.gs > 32 and name == "frontier_jacobi":
+    def _launch(self, name, ngroups, *args):
+        k = _module(_SRC, GS=self.gs, NC=self.C, REAL="double" if self.real is np.float64 else "float")
+        k = k.get_function(name)
+        if self.gs > 32 and name == "frontier_jacobi":  # one block per row (DynLP's mapping)
             k((ngroups,), (self.gs,), args)
         else:
-            tpb = self.threads
-            blocks = (ngroups * self.gs + tpb - 1) // tpb
-            k((blocks,), (tpb,), args)
+            k(((ngroups * self.gs + self.threads - 1) // self.threads,), (self.threads,), args)
 
-    def count(self, rows):
+    def _rows(self, rows):
         ip = self.W.indptr
         self.edges += (ip[rows + 1] - ip[rows]).sum(dtype=self.B.xp.int64)
+        return rows.astype(self.B.xp.int32), np.int32(rows.shape[0])
 
-    def _scalar(self, v):
-        return np.float64(v) if self.real == "double" else np.float32(v)
-
-    # ------------------------------------------------------------- kernels
     def jacobi(self, frontier, X, rhs, diag, delta):
         """New values for frontier rows and a changed-by-more-than-delta flag."""
-        xp = self.B.xp
-        nf = int(frontier.shape[0])
-        self.count(frontier)
+        xp, W = self.B.xp, self.W
+        f, nf = self._rows(frontier)
         if self.use_kernel:
-            Y = xp.empty((nf, self.C), dtype=X.dtype)
-            ch = xp.empty(nf, dtype=xp.uint8)
-            W = self.W
-            self._launch("frontier_jacobi", nf,
-                         (W.indptr, W.indices, W.data, frontier.astype(xp.int32), np.int32(nf),
-                          xp.ascontiguousarray(X), xp.ascontiguousarray(rhs), diag,
-                          self._scalar(delta), Y, ch))
+            Y, ch = xp.empty((int(nf), self.C), dtype=X.dtype), xp.empty(int(nf), dtype=xp.uint8)
+            self._launch("frontier_jacobi", int(nf), W.indptr, W.indices, W.data, f, nf, xp.ascontiguousarray(X),
+                         xp.ascontiguousarray(rhs), diag, self.real(delta), Y, ch)
             return Y, ch.astype(bool)
-        acc = self.W[frontier] @ X
-        Y = (rhs[frontier] + acc) / diag[frontier][:, None]
+        Y = (rhs[frontier] + W[frontier] @ X) / diag[frontier][:, None]
         return Y, (xp.abs(Y - X[frontier]) > delta).any(axis=1)
 
     def push(self, frontier, D, R, mark):
         """R += W[:, frontier] @ D (W symmetric) and mark touched vertices."""
-        xp = self.B.xp
-        nf = int(frontier.shape[0])
-        self.count(frontier)
+        xp, W = self.B.xp, self.W
+        f, nf = self._rows(frontier)
         if self.use_kernel:
-            W = self.W
-            self._launch("push_scatter", nf,
-                         (W.indptr, W.indices, W.data, frontier.astype(xp.int32), np.int32(nf),
-                          xp.ascontiguousarray(D), R, mark))
-            return
-        sub = self.W[frontier]
+            return self._launch("push_scatter", int(nf), W.indptr, W.indices, W.data, f, nf,
+                                xp.ascontiguousarray(D), R, mark)
+        sub = W[frontier]
         seg = xp.searchsorted(sub.indptr[1:], xp.arange(sub.nnz), side="right")
         self.B.scatter_add(R, sub.indices, sub.data[:, None] * D[seg])
         mark[sub.indices] = 1
 
     def mark_neighbors(self, rows, mark):
-        xp = self.B.xp
-        nr = int(rows.shape[0])
-        self.count(rows)
+        r, nr = self._rows(rows)
         if self.use_kernel:
-            W = self.W
-            self._launch("mark_neighbors", nr,
-                         (W.indptr, W.indices, rows.astype(xp.int32), np.int32(nr), mark))
-            return
+            return self._launch("mark_neighbors", int(nr), self.W.indptr, self.W.indices, r, nr, mark)
         mark[self.W[rows].indices] = 1
