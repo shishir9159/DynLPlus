@@ -1,8 +1,4 @@
-"""Array backend: NumPy/SciPy on CPU, CuPy/cuSPARSE on GPU.
-
-Every module calls ``get()`` and uses ``B.xp`` / ``B.sp`` so the same code runs
-on a laptop (for tests) and on an H100.
-"""
+"""Array backend: NumPy/SciPy on CPU, CuPy/cuSPARSE on GPU; modules use get().xp / .sp."""
 from __future__ import annotations
 
 import time
@@ -13,20 +9,17 @@ from typing import Any
 @dataclass
 class Backend:
     name: str
-    xp: Any            # numpy or cupy
-    sp: Any            # scipy.sparse or cupyx.scipy.sparse
+    xp: Any  # numpy or cupy
+    sp: Any  # scipy.sparse or cupyx.scipy.sparse
     is_gpu: bool
 
-    # ---- scatter helpers (unbuffered, duplicate-safe) ----
-    # ufunc.at on NumPy and recent CuPy; cupyx.scatter_* on older CuPy.
     def _at(self, ufunc, legacy, a, idx, v):
-        if not self.is_gpu or hasattr(ufunc, "at"):
-            try:
-                ufunc.at(a, idx, v)
-                return
-            except (AttributeError, NotImplementedError, TypeError):
-                if not self.is_gpu:
-                    raise
+        """Unbuffered scatter: ufunc.at on NumPy and recent CuPy, cupyx.scatter_* on older CuPy."""
+        try:
+            return ufunc.at(a, idx, v)
+        except (AttributeError, NotImplementedError, TypeError):
+            if not self.is_gpu:
+                raise
         import cupyx
         getattr(cupyx, legacy)(a, idx, v)
 
@@ -41,23 +34,16 @@ class Backend:
 
     def sync(self):
         if self.is_gpu:
-            import cupy
-            cupy.cuda.Device().synchronize()
+            self.xp.cuda.Device().synchronize()
 
     def asnumpy(self, x):
-        if self.is_gpu:
-            import cupy
-            return cupy.asnumpy(x)
-        return x
+        return self.xp.asnumpy(x) if self.is_gpu else x
 
     def csr(self, data, indices, indptr, shape):
         return self.sp.csr_matrix((data, indices, indptr), shape=shape)
 
     def mem_used_gb(self) -> float:
-        if not self.is_gpu:
-            return 0.0
-        import cupy
-        return cupy.get_default_memory_pool().used_bytes() / 1e9
+        return self.xp.get_default_memory_pool().used_bytes() / 1e9 if self.is_gpu else 0.0
 
 
 _current: Backend | None = None
@@ -83,11 +69,11 @@ def set_backend(name: str = "auto") -> Backend:
 
 
 def get() -> Backend:
-    return _current if _current is not None else set_backend("auto")
+    return _current or set_backend("auto")
 
 
 class Timer:
-    """Wall-clock timer that synchronizes the device on enter/exit."""
+    """Wall-clock timer that synchronizes the device on enter and exit."""
 
     def __init__(self):
         self.ms = 0.0
