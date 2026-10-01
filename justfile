@@ -5,6 +5,8 @@ export PATH := env("HOME", "~") + "/.local/bin:" + env("PATH")
 # CuPy extra matching the driver: nvidia-smi prints "CUDA Version: 12.8" or "CUDA UMD Version: 13.4"
 _cu := `v=$(nvidia-smi 2>/dev/null | grep -oE 'CUDA (UMD )?Version: [0-9]+' | grep -oE '[0-9]+$' | head -1 || true); [ "${v:-12}" -ge 13 ] && echo cu13 || echo cu12`
 CU := env("CU", _cu)
+export DATA_DIR := env("DATA_DIR", "data")
+imdb := "https://huggingface.co/datasets/stanfordnlp/imdb/resolve/main/plain_text"
 py := "uv run --no-sync python"
 b := py + " -m dynlp.bench"
 kb := py + " -m dynlp.kernelbench"
@@ -23,14 +25,23 @@ setup:
     {{py}} -c "import cupy as c; p=c.cuda.runtime.getDeviceProperties(0); print(p['name'].decode(), 'cc', p['major'], p['minor'])"
     uv run --no-sync pytest -q
 
+[private]
+ready:
+    [ -f .venv/.ready ] || { just setup && touch .venv/.ready; }
+
 test *args:
     uv run --no-sync pytest -q {{args}}
 
-# the paper's IMDB graph (downloads ~41 MB once) and the generated synth2 / synth10 -> data/*.npz
-data:
+# the paper's IMDB reviews (Maas et al. 2011; Hugging Face copy, ~41 MB) -> $DATA_DIR/imdb-{train,test}.parquet
+download:
+    mkdir -p $DATA_DIR
+    for s in train test; do f=$DATA_DIR/imdb-$s.parquet; [ -f $f ] || { echo "downloading $f"; curl -fsSL --retry 3 -o $f.part {{imdb}}/$s-00000-of-00001.parquet && mv $f.part $f; }; done
+
+# graphs: IMDB (TF-IDF, cosine 5-NN) and the generated synth2 / synth10 -> $DATA_DIR/*.npz (default ./data)
+data: ready download
     {{py}} -c "from dynlp import graphs; [print(graphs.build_cached(d)) for d in ('imdb', 'synth2', 'synth10')]"
 
-# ~10 min: every method on IMDB, synth2, synth10, SBM 1M; resident path; kernels -> results/sanity/matrix.md
+# one command on a fresh box: setup (once), download, graphs, then ~10 min of runs -> results/sanity/matrix.md
 sanity: data
     #!/usr/bin/env bash
     set -uo pipefail
@@ -57,13 +68,13 @@ compare: data
     just matrix $o
 
 # kernel mappings vs cuSPARSE and our row-major SpMM, all rows, 2..64 columns
-kernels:
+kernels: ready
     mkdir -p results/kernels
     {{kb}} --dataset sbm --n 20000000 --cols 2,16,32,64 --out results/kernels/sbm20m.csv
     {{kb}} --dataset er --n 50000000 --deg 5 --cols 2,16 --out results/kernels/er50m.csv
 
 # nsys timeline and ncu report of the frontier kernel
-profile:
+profile: ready
     mkdir -p results/profile
     nsys profile -o results/profile/nsys --force-overwrite true --trace=cuda,nvtx {{b}} --dataset sbm --n 5000000 --batches 3 --solvers dynlp,dynlp+auto --no-reference --no-warmup
     ncu --set full -k regex:frontier_jacobi --launch-count 5 -o results/profile/ncu -f {{b}} --dataset sbm --n 5000000 --batches 1 --solvers dynlp --no-reference --no-warmup

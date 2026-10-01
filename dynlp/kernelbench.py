@@ -20,7 +20,7 @@ def main(argv=None):
     for flag, typ, default in [("--dataset", str, "sbm"), ("--n", int, 1_000_000), ("--deg", float, 10.0),
                                ("--dtype", str, "float32"), ("--cols", str, "2,16,32,64"),
                                ("--groups", str, "8,32,128,cols"), ("--reps", int, 10), ("--seed", int, 0),
-                               ("--data-dir", str, "data"), ("--out", str, None)]:
+                               ("--data-dir", str, graphs.DATA_DIR), ("--out", str, None)]:
         ap.add_argument(flag, type=typ, default=default)
     a = ap.parse_args(argv)
     ds = graphs.load(a.dataset, n=a.n, deg=a.deg, seed=a.seed, dtype=a.dtype, data_dir=a.data_dir)

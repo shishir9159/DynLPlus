@@ -1,8 +1,8 @@
 """Graph datasets. A dataset is a symmetric, non-negative, loop-free CSR ``A`` with labels
 ``y`` in [0, K) and an arrival ``order`` that the stream reveals vertices in.
 
-imdb      the paper's IMDB graph: the 50K labeled reviews (Maas et al. 2011, Hugging Face
-          copy), TF-IDF, cosine kNN (k = 5), binary
+imdb      the paper's IMDB graph: the 50K labeled reviews (Maas et al. 2011; fetched by
+          `just download`), TF-IDF, cosine kNN (k = 5), binary
 synth{K}  50K-vertex cosine kNN (k = 5) over a mixture with dense and sparse
           sub-clusters, dense ones of different classes overlapping (K = 2 or 10)
 sbm, er   planted partition and Erdos-Renyi graphs for scale runs
@@ -12,15 +12,13 @@ from __future__ import annotations
 import math
 import os
 import re
-import shutil
-import urllib.request
 from array import array
 from collections import Counter
 from dataclasses import dataclass
 
 from .backend import scatter_add, sp, xp
 
-IMDB_URL = "https://huggingface.co/datasets/stanfordnlp/imdb/resolve/main/plain_text/{}-00000-of-00001.parquet"
+DATA_DIR = os.environ.get("DATA_DIR", "data")  # where downloads and graph caches live
 
 
 @dataclass
@@ -145,18 +143,6 @@ def synth(n=50_000, K=10, k=5, dim=16, subs=5, seed=0, dtype="float32") -> Datas
     return Dataset(f"synth{K}", knn_graph(X, k, dtype), (sub // subs).astype(xp.int32), K, perm(n))
 
 
-def _download(url, path, timeout=60):
-    """Fetch to path.part, rename only when complete: an interrupted download never looks finished."""
-    print(f"[data] downloading {url} ...", flush=True)
-    try:
-        with urllib.request.urlopen(url, timeout=timeout) as r, open(path + ".part", "wb") as fh:
-            shutil.copyfileobj(r, fh, 1 << 20)
-        os.replace(path + ".part", path)
-    finally:
-        if os.path.exists(path + ".part"):
-            os.remove(path + ".part")
-
-
 def tfidf(docs, min_df=5, max_df=0.5):
     """L2-normalized TF-IDF CSR (sublinear tf, smooth idf) of tokenized documents."""
     df = Counter(t for d in docs for t in set(d))
@@ -174,28 +160,17 @@ def tfidf(docs, min_df=5, max_df=0.5):
 
 
 def _imdb_reviews(data_dir):
-    """(tokens, labels) of the 25K train + 25K test labeled reviews (downloads ~41 MB once)."""
+    """(tokens, labels) of the 25K train + 25K test labeled reviews in data_dir/imdb-{train,test}.parquet."""
     import pandas as pd
     word, docs, ys = re.compile(r"\b\w\w+\b"), [], []
     for split in ("train", "test"):
         path = os.path.join(data_dir, f"imdb-{split}.parquet")
         if not os.path.exists(path):
-            _download(IMDB_URL.format(split), path)
+            raise FileNotFoundError(f"{path} is missing: run `just download`")
         df = pd.read_parquet(path)
         docs += [word.findall(t.lower().replace("<br />", " ")) for t in df.text]
         ys += df.label.tolist()
     return docs, ys
-
-
-def _cached(path, build):
-    """Load an edge-list cache (src, dst, w, y), building it first if missing."""
-    if not os.path.exists(path):
-        A, y = build()
-        r = csr_rows(A)
-        up = r < A.indices
-        xp.savez(path, src=r[up], dst=A.indices[up], w=A.data[up], y=y)
-    z = xp.load(path)
-    return z["src"], z["dst"], z["w"], z["y"]
 
 
 def from_npz(path, dtype="float32", seed=0, name=None) -> Dataset:
@@ -209,25 +184,27 @@ def from_npz(path, dtype="float32", seed=0, name=None) -> Dataset:
     return Dataset(name or os.path.basename(path), A, y, int(y.max()) + 1, order)
 
 
-def build_cached(spec, data_dir="data"):
-    """Build data/<spec>.npz if missing: imdb (downloads ~41 MB once), synth2, synth10."""
-    os.makedirs(data_dir, exist_ok=True)
+def build_cached(spec, data_dir=DATA_DIR):
+    """Build DATA_DIR/<spec>.npz (upper-triangle edge list + labels) if missing: imdb, synth2, synth10."""
     path = os.path.join(data_dir, f"{spec}.npz")
+    if os.path.exists(path):
+        return path
     if spec == "imdb":
-        def build():
-            docs, y = _imdb_reviews(data_dir)
-            return knn_graph(tfidf(docs), 5, "float32"), xp.asarray(y, dtype=xp.int32)
-    elif spec.startswith("synth"):
-        def build():
-            ds = synth(K=int(spec[5:]))
-            return ds.A, ds.y
+        docs, y = _imdb_reviews(data_dir)
+        A, y = knn_graph(tfidf(docs), 5, "float32"), xp.asarray(y, dtype=xp.int32)
+    elif re.fullmatch(r"synth\d+", spec):
+        ds = synth(K=int(spec[5:]))
+        A, y = ds.A, ds.y
     else:
         raise ValueError(f"unknown dataset {spec!r}")
-    _cached(path, build)
+    os.makedirs(data_dir, exist_ok=True)
+    r = csr_rows(A)
+    up = r < A.indices
+    xp.savez(path, src=r[up], dst=A.indices[up], w=A.data[up], y=y)
     return path
 
 
-def load(spec: str, *, n=100_000, K=2, deg=10.0, p_in=0.85, seed=0, dtype="float32", data_dir="data") -> Dataset:
+def load(spec: str, *, n=100_000, K=2, deg=10.0, p_in=0.85, seed=0, dtype="float32", data_dir=DATA_DIR) -> Dataset:
     if spec == "sbm":
         return sbm(n, K, deg, p_in, seed, dtype)
     if spec == "er":

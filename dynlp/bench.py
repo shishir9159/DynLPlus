@@ -21,7 +21,7 @@ from .stream import IncrementalStream, Stream
 ARGS = [  # (flag, type, default, help); type None = store_true
     ("--dataset", str, "imdb", "imdb | synth2 | synth10 | sbm | er | path/to/graph.npz"),
     ("--n", int, 100_000, "sbm/er size"), ("--classes", int, 2, "sbm/er classes"), ("--deg", float, 10.0, None),
-    ("--p-in", float, 0.85, "SBM: fraction of intra-class edges"), ("--data-dir", str, "data", None),
+    ("--p-in", float, 0.85, "SBM: fraction of intra-class edges"), ("--data-dir", str, graphs.DATA_DIR, "default: $DATA_DIR or ./data"),
     ("--label-frac", float, 0.01, None), ("--init-frac", float, 0.1, None), ("--batches", int, 10, None),
     ("--del-frac", float, 0.1, None), ("--eta-rel", float, 0.0, "dongle regularizer (x mean degree)"),
     ("--incremental", None, False, "keep the batch system resident (needed by dynlp+inc)"),
