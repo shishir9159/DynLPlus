@@ -8,6 +8,7 @@ from __future__ import annotations
 import gzip
 import io
 import os
+import shutil
 import urllib.request
 import zipfile
 from dataclasses import dataclass
@@ -129,6 +130,18 @@ _OGB = {name: f"http://snap.stanford.edu/ogb/data/nodeproppred/{name[5:]}.zip"
         for name in ("ogbn-arxiv", "ogbn-products")}
 
 
+def _download(url, path, timeout=60):
+    """Fetch to path.part, rename only when complete: an interrupted download never looks finished."""
+    print(f"[data] downloading {url} ...", flush=True)
+    try:
+        with urllib.request.urlopen(url, timeout=timeout) as r, open(path + ".part", "wb") as fh:
+            shutil.copyfileobj(r, fh, 1 << 20)
+        os.replace(path + ".part", path)
+    finally:
+        if os.path.exists(path + ".part"):
+            os.remove(path + ".part")
+
+
 def _read_csv_gz(zf, member, dtype):
     with zf.open(member) as fh:
         raw = io.BytesIO(gzip.decompress(fh.read()))
@@ -148,8 +161,7 @@ def ogbn(name, data_dir="data", seed=0, dtype="float32") -> Dataset:
     if not os.path.exists(cache):
         zpath = os.path.join(data_dir, os.path.basename(_OGB[name]))
         if not os.path.exists(zpath):
-            print(f"[data] downloading {_OGB[name]} ...", flush=True)
-            urllib.request.urlretrieve(_OGB[name], zpath)
+            _download(_OGB[name], zpath)
         with zipfile.ZipFile(zpath) as zf:
             names = zf.namelist()
             read = lambda s, dt: _read_csv_gz(zf, next(m for m in names if m.endswith(s)), dt)[:, :2]  # noqa: E731
