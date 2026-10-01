@@ -18,3 +18,5 @@ __pycache__/
 data/
 results/h100/
 results/*.tar.gz
+results/sanity/
+results/*.log

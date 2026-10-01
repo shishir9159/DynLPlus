@@ -84,6 +84,26 @@ figs:
 # e1..e5, e7 and figures (several hours)
 all: smoke e1 e2 e3 e4 e5 e7 figs
 
+# ~10-minute check of every experiment at small scale, no downloads: results/sanity.tar.gz
+sanity:
+    #!/usr/bin/env bash
+    set -uo pipefail
+    o=results/sanity && rm -rf $o && mkdir -p $o {{OUT}}/.done && T0=$(date +%s)
+    [ -f {{OUT}}/.done/setup ] || { just setup && touch {{OUT}}/.done/setup; } || exit 1
+    run() { local n=$1 s=$(date +%s); shift; "$@" > $o/$n.log 2>&1; local rc=$?
+            echo "$n $(( $(date +%s) - s ))s exit=$rc" | tee -a $o/stages.log; tail -n 6 $o/$n.log; }
+    run e2 {{b}} --dataset er --n 2000000 --deg 5 --init-frac 1.0 --batches 0 --solvers itlp,dynlp,dynlp+pcg --out $o/e2_er2m.csv
+    for p in "1e-4 1e-3" "1e-6 1e-4"; do set -- $p
+      run e4_$1 {{b}} {{sbm}} --n 500000 --batches 5 --solvers dynlp,dynlp+pcg --delta $1 --tol $2 --out $o/e4_sweep.csv --tag "delta=$1,tol=$2"; done
+    run e7_rebuild {{b}} {{sbm}} --n 1000000 --init-frac 0.95 --batches 20 --solvers dynlp,dynlp+auto --no-reference --out $o/e7_rebuild.csv
+    run e7_resident {{b}} --incremental {{sbm}} --n 1000000 --init-frac 0.95 --batches 20 --solvers dynlp+auto,dynlp+inc --no-reference --out $o/e7_resident.csv
+    run e7_check {{b}} --incremental {{sbm}} --n 200000 --init-frac 0.9 --batches 10 --solvers dynlp+inc --out $o/e7_check.csv
+    run e5_sbm {{b}} {{sbm}} --n 500000 --classes 16 --batches 3 --solvers dynlp,dynlp+pcg --out $o/e5_sbm_K16.csv
+    run e5_knn {{b}} --dataset gmm-knn --n 100000 --classes 40 --init-frac 0.5 --batches 3 --solvers dynlp,dynlp+pcg --out $o/e5_knn_K40.csv
+    run e1 {{kb}} {{sbm}} --n 2000000 --cols 2,32 --fracs 0.01,1.0 --groups 8,32,128,cols --reps 5 --out $o/e1_kernels.csv
+    just --set OUT $o figs > $o/figs.log 2>&1
+    tar czf results/sanity.tar.gz $o && echo "total $(( $(date +%s) - T0 ))s -> results/sanity.tar.gz"
+
 # download OGB data up front, so rented GPU time isn't spent on it
 data: dirs
     {{py}} -c "from dynlp import backend, graphs; backend.set_backend('numpy'); [graphs.ogbn(d) for d in ('ogbn-arxiv', 'ogbn-products')]"
