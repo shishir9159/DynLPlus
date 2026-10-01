@@ -8,7 +8,7 @@ _cu := `v=$(nvidia-smi 2>/dev/null | grep -oE 'CUDA (UMD )?Version: [0-9]+' | gr
 CU := env("CU", _cu)
 py := "uv run --no-sync python"
 b := py + " -m dynlp.bench --backend cupy"
-kb := py + " -m dynlp.kernelbench --fracs 0.001,0.01,0.1,1.0 --groups 1,2,4,8,16,32,128,256"
+kb := py + " -m dynlp.kernelbench --fracs 0.001,0.01,0.1,1.0 --groups 1,2,4,8,16,32,128,256,cols"
 sbm := "--dataset sbm --deg 10"
 all_s := "itlp,itlp-warm,dynlp,dynlp-knowninit,dynlp+push,dynlp+pcg,dynlp+amg,dynlp+auto"
 big_s := "itlp,itlp-warm,dynlp,dynlp-knowninit,dynlp+pcg,dynlp+amg,dynlp+auto"
@@ -38,6 +38,8 @@ smoke: dirs
 e1: dirs
     {{kb}} {{sbm}} --n 20000000 --cols 1,2,8,32 --out {{OUT}}/e1_kernels_sbm20m.csv
     {{kb}} --dataset er --n 50000000 --deg 5 --cols 1,2 --out {{OUT}}/e1_kernels_er50m.csv
+    {{kb}} {{sbm}} --n 5000000 --cols 16,32,64 --fracs 0.01,1.0 --groups 8,32,cols --out {{OUT}}/e1_kernels_classes.csv
+    for r in none rcm; do {{kb}} --dataset ogbn-products --cols 1,47 --fracs 0.01,1.0 --groups 8,cols --reorder $r --out {{OUT}}/e1_kernels_products_$r.csv; done
 
 # paper's single batch on the 50M random graph
 e2: dirs
@@ -81,6 +83,40 @@ figs:
 
 # e1..e5, e7 and figures (several hours)
 all: smoke e1 e2 e3 e4 e5 e7 figs
+
+# download OGB data up front, so rented GPU time isn't spent on it
+data: dirs
+    {{py}} -c "from dynlp import backend, graphs; backend.set_backend('numpy'); [graphs.ogbn(d) for d in ('ogbn-arxiv', 'ogbn-products')]"
+
+# rented GPU: setup, then stages by priority until the time box runs out; resumable; ends with a tarball
+rent hours="6" stages="smoke e2 e4 e3 e7 e5 e1 e6":
+    #!/usr/bin/env bash
+    set -uo pipefail
+    mkdir -p {{OUT}}/.done && log={{OUT}}/stages.log && end=$(( $(date +%s) + {{hours}} * 3600 ))
+    [ -f {{OUT}}/.done/setup ] || { just setup && just data && touch {{OUT}}/.done/setup; } || exit 1
+    for s in {{stages}}; do
+      [ -f {{OUT}}/.done/$s ] && { echo "skip $s (done)"; continue; }
+      [ $(date +%s) -lt $end ] || { echo "time box reached; left: $s ..."; break; }
+      rm -f {{OUT}}/${s}_*.csv {{OUT}}/$s.csv; t0=$(date +%s)
+      just $s; rc=$?
+      echo "$s $(date -d @$t0 '+%F %T') $(( $(date +%s) - t0 ))s exit=$rc" | tee -a $log
+      [ $rc -eq 0 ] && touch {{OUT}}/.done/$s
+    done
+    just figs; just pack
+
+# same as rent, detached from the SSH session; follow with `just status`
+rent-bg hours="6":
+    mkdir -p {{OUT}} && nohup just rent {{hours}} > {{OUT}}/rent.log 2>&1 &
+    @echo "running in the background: tail -f {{OUT}}/rent.log"
+
+# what finished, how long it took, and the last log lines
+status:
+    @echo "done: $(ls {{OUT}}/.done 2>/dev/null | xargs)"; cat {{OUT}}/stages.log 2>/dev/null; tail -n 5 {{OUT}}/rent.log 2>/dev/null || true
+
+# results/h100.tar.gz: CSVs, configs, figures and logs (no profiles); copy it back before the box goes away
+pack:
+    tar czf results/h100.tar.gz --exclude='*.nsys-rep' --exclude='*.ncu-rep' {{OUT}}
+    @echo "scp $(whoami)@$(hostname -I 2>/dev/null | cut -d' ' -f1):$(pwd)/results/h100.tar.gz ."
 
 # submit a stage to SLURM (add --partition/--account for your site)
 slurm stage="all":

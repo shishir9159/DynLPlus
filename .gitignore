@@ -17,3 +17,4 @@ __pycache__/
 .pytest_cache/
 data/
 results/h100/
+results/*.tar.gz
