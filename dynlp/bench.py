@@ -23,7 +23,8 @@ ARGS = {  # group: [(flag, type, default, help)]; type None = store_true
     "dataset": [("--dataset", str, "sbm", "sbm | er | gmm-knn | ogbn-arxiv | ogbn-products | path/to/graph.npz"),
                 ("--n", int, 100_000, None), ("--classes", int, 2, None), ("--deg", float, 10.0, None),
                 ("--p-in", float, 0.85, "SBM: fraction of intra-class edges"), ("--knn", int, 10, None),
-                ("--dim", int, 32, None), ("--data-dir", str, "data", None)],
+                ("--dim", int, 32, None), ("--data-dir", str, "data", None),
+                ("--reorder", str, "none", "relabel vertices for locality: none | rcm")],
     "stream": [("--label-frac", float, 0.01, None), ("--init-frac", float, 0.1, None), ("--batches", int, 10, None),
                ("--del-frac", float, 0.1, None), ("--eta-rel", float, 0.0, "dongle regularizer (x mean degree)"),
                ("--incremental", None, False, "keep the batch system resident (needed by dynlp+inc)")],
@@ -85,7 +86,7 @@ def main(argv=None):
     print("[env]", json.dumps(info), flush=True)
     t0 = time.perf_counter()
     ds = graphs.load(a.dataset, n=a.n, K=a.classes, deg=a.deg, p_in=a.p_in, knn=a.knn, dim=a.dim, seed=a.seed,
-                     dtype=a.dtype, data_dir=a.data_dir)
+                     dtype=a.dtype, data_dir=a.data_dir, reorder=a.reorder)
     be.sync()
     print(f"[data] {ds.name}: n={ds.n:,} nnz={ds.nnz:,} K={ds.K} ({time.perf_counter() - t0:.1f}s, "
           f"gpu mem {be.mem_used_gb():.1f} GB)", flush=True)

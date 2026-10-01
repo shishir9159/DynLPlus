@@ -22,13 +22,15 @@ def main(argv=None):
     for flag, typ, default in [("--dataset", str, "sbm"), ("--n", int, 1_000_000), ("--classes", int, 2),
                                ("--deg", float, 10.0), ("--dtype", str, "float32"), ("--cols", str, "1,2,8"),
                                ("--fracs", str, "0.001,0.01,0.1,1.0"), ("--groups", str, "1,2,4,8,16,32,128,cols"),
-                               ("--reps", int, 20), ("--seed", int, 0), ("--data-dir", str, "data"), ("--out", str, None)]:
+                               ("--reps", int, 20), ("--seed", int, 0), ("--data-dir", str, "data"), ("--out", str, None),
+                               ("--reorder", str, "none")]:
         ap.add_argument(flag, type=typ, default=default)
     a = ap.parse_args(argv)
 
     be = backend.set_backend("cupy")
     import cupy as cp
-    ds = graphs.load(a.dataset, n=a.n, K=a.classes, deg=a.deg, seed=a.seed, dtype=a.dtype, data_dir=a.data_dir)
+    ds = graphs.load(a.dataset, n=a.n, K=a.classes, deg=a.deg, seed=a.seed, dtype=a.dtype, data_dir=a.data_dir,
+                     reorder=a.reorder)
     W, n, real = ds.A, ds.A.shape[0], np.dtype(a.dtype).itemsize
     deg = np.diff(be.asnumpy(W.indptr))
     print(f"[data] {ds.name}: n={n:,} nnz={W.nnz:,} mean deg={deg.mean():.1f} max deg={deg.max():,}")
