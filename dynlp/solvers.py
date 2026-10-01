@@ -17,7 +17,7 @@ from dataclasses import dataclass
 
 import numpy as np
 
-from . import backend
+from . import backend, kernels
 from .amg import AMG
 from .backend import Timer
 from .kernels import FrontierOps
@@ -39,11 +39,19 @@ def _xp():
     return backend.get().xp
 
 
+def _rowmajor(W, X):  # GPU and 2+ columns: our row-major SpMM beats cuSPARSE's column-major csrmm
+    return backend.get().is_gpu and X.shape[1] > 1 and X.dtype == W.data.dtype
+
+
 def spmm(W, X):
-    return (W @ X[:, 0])[:, None] if X.shape[1] == 1 else W @ X
+    if X.shape[1] == 1:
+        return (W @ X[:, 0])[:, None]
+    return kernels.spmm_axpy(W, X) if _rowmajor(W, X) else W @ X
 
 
 def apply_A(sys: System, X):
+    if _rowmajor(sys.W, X):
+        return kernels.spmm_axpy(sys.W, X, a=sys.diag, b=-1.0)
     return sys.diag[:, None] * X - spmm(sys.W, X)
 
 

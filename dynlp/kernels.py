@@ -139,6 +139,33 @@ extern "C" __global__ void mark_neighbors(
   for (int j = indptr[row] + lane; j < indptr[row + 1]; j += GS) mark[indices[j]] = 1;
 }}
 
+// Y[row] = a[row] * X[row] + b * sum_j w_j X[col_j] for every row (row-major SpMM, fused axpy)
+extern "C" __global__ void spmm_axpy(
+    const int* __restrict__ indptr, const int* __restrict__ indices, const real* __restrict__ w, const int n,
+    const real* __restrict__ X, const real* __restrict__ a, const real b, real* __restrict__ Y)
+{{
+  const long long tid = (long long)blockIdx.x * blockDim.x + threadIdx.x;
+  const long long row = tid / GS;
+  const int lane = (int)(tid % GS);
+  const bool valid = row < n;
+  const int beg = valid ? indptr[row] : 0, end = valid ? indptr[row + 1] : 0;
+  real acc[NC];
+  #pragma unroll
+  for (int c = 0; c < NC; ++c) acc[c] = 0;
+  for (int j = beg + lane; j < end; j += GS) {{
+    const long long v = indices[j];
+    const real wv = w[j];
+    #pragma unroll
+    for (int c = 0; c < NC; ++c) acc[c] += wv * X[v * NC + c];
+  }}
+  #pragma unroll
+  for (int c = 0; c < NC; ++c) acc[c] = group_sum(acc[c]);
+  if (valid && lane == 0) {{
+    const real ar = a ? a[row] : (real)0;
+    #pragma unroll
+    for (int c = 0; c < NC; ++c) Y[row * NC + c] = ar * X[row * NC + c] + b * acc[c];
+  }}
+}}
 """
 
 # Class-parallel mapping (multi-class), after sparse-attention kernels that spread the
@@ -212,6 +239,33 @@ extern "C" __global__ void push_scatter(
   }}
 }}
 
+extern "C" __global__ void spmm_axpy(
+    const int* __restrict__ indptr, const int* __restrict__ indices, const real* __restrict__ w, const int n,
+    const real* __restrict__ X, const real* __restrict__ a, const real b, real* __restrict__ Y)
+{{
+  const long long row = ((long long)blockIdx.x * blockDim.x + threadIdx.x) >> 5;
+  const int lane = threadIdx.x & 31, l = lane % LC, e = lane / LC;
+  if (row >= n) return;
+  const int beg = indptr[row], end = indptr[row + 1];
+  real acc[CPL];
+  #pragma unroll
+  for (int k = 0; k < CPL; ++k) acc[k] = 0;
+  for (int j = beg + e; j < end; j += LE) {{
+    const long long v = indices[j];
+    const real wv = w[j];
+    #pragma unroll
+    for (int k = 0; k < CPL; ++k) if (l + k * LC < NC) acc[k] += wv * X[v * NC + l + k * LC];
+  }}
+  #pragma unroll
+  for (int k = 0; k < CPL; ++k)
+    for (int off = LC; off < 32; off <<= 1) acc[k] += __shfl_xor_sync(0xffffffffu, acc[k], off);
+  if (e == 0) {{
+    const real ar = a ? a[row] : (real)0;
+    #pragma unroll
+    for (int k = 0; k < CPL; ++k)
+      if (l + k * LC < NC) Y[row * NC + l + k * LC] = ar * X[row * NC + l + k * LC] + b * acc[k];
+  }}
+}}
 """
 
 # Fused, asynchronous push: two kernels per round, no host sync per round.
@@ -321,6 +375,26 @@ def auto_group(avg_deg: float) -> int:
 
 def _group(W, group):
     return auto_group(W.nnz / max(W.shape[0], 1)) if group == "auto" else int(group)
+
+
+def spmm_axpy(W, X, a=None, b=1.0, group="auto"):
+    """a * X + b * (W @ X) for row-major X (n x C, C >= 2) on the GPU, in one pass.
+    cuSPARSE's csrmm wants column-major X, and the conversion plus column-wise
+    gathers made it 2-25x slower than this kernel (Sputnik's row-major SpMM)."""
+    import cupy
+    n, C = W.shape[0], X.shape[1]
+    X = cupy.ascontiguousarray(X)
+    Y = cupy.empty((n, C), dtype=X.dtype)
+    real = "double" if X.dtype == np.float64 else "float"
+    rb = (np.float64 if X.dtype == np.float64 else np.float32)(b)
+    args = (W.indptr, W.indices, W.data, np.int32(n), X, a if a is not None else np.uint64(0), rb, Y)  # 0: null
+    if C >= COLS_MIN:
+        k = _module(_COLS_SRC, NC=C, LC=min(32, 1 << (C - 1).bit_length()), REAL=real).get_function("spmm_axpy")
+        k(((n * 32 + 255) // 256,), (256,), args)
+    else:
+        gs = min(_group(W, group), 32)
+        _module(_SRC, GS=gs, NC=C, REAL=real).get_function("spmm_axpy")(((n * gs + 255) // 256,), (256,), args)
+    return Y
 
 
 class FusedPush:

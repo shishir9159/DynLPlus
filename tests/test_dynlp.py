@@ -232,3 +232,16 @@ def test_refinement_certifies_beyond_float32(be, method):
     assert stats.cert <= 1e-3
     assert err <= stats.cert * 1.05 + 1e-9
 
+
+@pytest.mark.skipif(not _gpu_ok(), reason="needs a CUDA GPU")
+@pytest.mark.parametrize("dtype", ["float32", "float64"])
+@pytest.mark.parametrize("C", [2, 8, 40])
+def test_rowmajor_spmm_matches_cusparse(dtype, C):
+    from dynlp.kernels import spmm_axpy
+    xp = backend.set_backend("cupy").xp
+    W = graphs.sbm(3000, K=2, deg=12, seed=8, dtype=dtype).A
+    rs = xp.random.RandomState(1)
+    X, a = rs.random_sample((3000, C)).astype(dtype), rs.random_sample(3000).astype(dtype)
+    tol = 1e-5 if dtype == "float32" else 1e-12
+    xp.testing.assert_allclose(spmm_axpy(W, X), W @ X, rtol=tol)
+    xp.testing.assert_allclose(spmm_axpy(W, X, a=a, b=-1.0), a[:, None] * X - W @ X, rtol=tol, atol=tol)
