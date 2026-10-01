@@ -171,9 +171,9 @@ def test_amg_is_symmetric_positive_definite():
 
 @pytest.mark.skipif(not _gpu_ok(), reason="needs a CUDA GPU")
 @pytest.mark.parametrize("dtype", ["float32", "float64"])
-@pytest.mark.parametrize("C", [1, 3])
-@pytest.mark.parametrize("gs", [1, 2, 8, 32, 128])
-def test_cuda_kernels_match_fallback(dtype, C, gs):
+@pytest.mark.parametrize("C,gs,mapping", [(C, gs, "rows") for C in (1, 3) for gs in (1, 2, 8, 32, 128)]
+                         + [(C, 8, "cols") for C in (1, 3, 8, 40)])
+def test_cuda_kernels_match_fallback(dtype, C, gs, mapping):
     be = backend.set_backend("cupy")
     xp = be.xp
     ds = graphs.sbm(3000, K=2, deg=12, seed=8, dtype=dtype)
@@ -184,7 +184,7 @@ def test_cuda_kernels_match_fallback(dtype, C, gs):
     X = rs.random_sample((n, C)).astype(dtype)
     rhs = rs.random_sample((n, C)).astype(dtype)
     diag = (W @ xp.ones(n, dtype=dtype) + 1).astype(dtype)
-    kops, fops = FrontierOps(W, C, gs), FrontierOps(W, C, gs)
+    kops, fops = FrontierOps(W, C, gs, mapping=mapping), FrontierOps(W, C, gs, mapping=mapping)
     fops.use_kernel = False
     assert kops.use_kernel
     Yk, ck = kops.jacobi(frontier, X, rhs, diag, 1e-2)
@@ -231,3 +231,4 @@ def test_refinement_certifies_beyond_float32(be, method):
     err = np.abs(host(solver.scores(sys)) - Fd).max()
     assert stats.cert <= 1e-3
     assert err <= stats.cert * 1.05 + 1e-9
+

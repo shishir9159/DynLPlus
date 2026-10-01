@@ -21,7 +21,7 @@ def main(argv=None):
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     for flag, typ, default in [("--dataset", str, "sbm"), ("--n", int, 1_000_000), ("--classes", int, 2),
                                ("--deg", float, 10.0), ("--dtype", str, "float32"), ("--cols", str, "1,2,8"),
-                               ("--fracs", str, "0.001,0.01,0.1,1.0"), ("--groups", str, "1,2,4,8,16,32,128"),
+                               ("--fracs", str, "0.001,0.01,0.1,1.0"), ("--groups", str, "1,2,4,8,16,32,128,cols"),
                                ("--reps", int, 20), ("--seed", int, 0), ("--data-dir", str, "data"), ("--out", str, None)]:
         ap.add_argument(flag, type=typ, default=default)
     a = ap.parse_args(argv)
@@ -59,15 +59,13 @@ def main(argv=None):
             e = int((W.indptr[fr + 1] - W.indptr[fr]).sum())
             byts = e * (4 + real + C * real) + nf * (4 + 8 + 3 * C * real + 1)
             res = []
-            for gs in [int(g) for g in a.groups.split(",")]:
-                ops = FrontierOps(W, C, gs)
-                if not ops.use_kernel:
-                    continue
-                ms = timeit(lambda: ops.jacobi(fr, X, rhs, diag, 1e-4))
-                res.append((gs, ms))
+            for g in a.groups.split(","):  # lanes per row, or "cols" for the class-parallel mapping
+                ops = FrontierOps(W, C, mapping="cols") if g == "cols" else FrontierOps(W, C, int(g), mapping="rows")
+                if ops.use_kernel:
+                    res.append((0 if g == "cols" else int(g), timeit(lambda: ops.jacobi(fr, X, rhs, diag, 1e-4))))
             best = min(m for _, m in res)
             for gs, ms in res:
-                label = f"{gs}" if gs <= 32 else f"blk{gs}"
+                label = "cols" if gs == 0 else f"{gs}" if gs <= 32 else f"blk{gs}"
                 print(f"{nf:>10,} {label:>6} {ms:9.3f} {e / ms / 1e6:8.2f} {byts / ms / 1e6:7.0f} {ms / best:7.1f}x")
                 rows.append(dict(dataset=ds.name, n=n, nnz=W.nnz, C=C, dtype=a.dtype, frontier=nf, edges=e,
                                  group=gs, ms=ms, gedges_s=e / ms / 1e6, gb_s=byts / ms / 1e6,

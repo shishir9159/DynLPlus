@@ -114,13 +114,13 @@ def kernels(df, outdir, tag):
     cols = sorted(df.C.unique())
     fig, axes = plt.subplots(1, len(cols), figsize=(5.5 * len(cols), 4), sharey=True, squeeze=False)
     groups = sorted(df.group.unique())
-    labels = [str(g) if g <= 32 else f"block/row ({g})" for g in groups]
+    labels = ["class-parallel" if g == 0 else str(g) if g <= 32 else f"block/row ({g})" for g in groups]
     for ax, C in zip(axes[0], cols):
         d = df[df.C == C]
         fronts = sorted(d.frontier.unique())
         ramp = BLUE_RAMP[-len(fronts):] if len(fronts) <= len(BLUE_RAMP) else BLUE_RAMP
         for f, colr in zip(fronts, ramp):
-            e = d[d.frontier == f].set_index("group").loc[groups]
+            e = d[d.frontier == f].set_index("group").reindex(groups)
             ax.plot(range(len(groups)), e.gedges_s, color=colr, marker="o", markersize=6, label=f"{f:,} rows")
         ax.set_xticks(range(len(groups)), labels, rotation=30, ha="right")
         ax.set_title(f"C = {C} column(s)", loc="left")

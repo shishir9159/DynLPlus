@@ -138,6 +138,80 @@ extern "C" __global__ void mark_neighbors(
   const int row = rows[g];
   for (int j = indptr[row] + lane; j < indptr[row + 1]; j += GS) mark[indices[j]] = 1;
 }}
+
+"""
+
+# Class-parallel mapping (multi-class), after sparse-attention kernels that spread the
+# head dimension across lanes: one warp per row, lanes split into LE edge groups x LC
+# class lanes, so a neighbour's row X[v, :] is read as one coalesced vector and atomics
+# on R[v, :] hit contiguous addresses. Any number of classes (CPL per lane).
+_COLS_SRC = r"""
+#define NC {NC}
+#define LC {LC}
+#define LE (32 / LC)
+#define CPL ((NC + LC - 1) / LC)
+typedef {REAL} real;
+
+#define ROW_SETUP \
+  const long long wid = ((long long)blockIdx.x * blockDim.x + threadIdx.x) >> 5; \
+  const int lane = threadIdx.x & 31, l = lane % LC, e = lane / LC; \
+  if (wid >= nf) return; \
+  const int row = frontier[wid], beg = indptr[row], end = indptr[row + 1];
+
+extern "C" __global__ void frontier_jacobi(
+    const int* __restrict__ indptr, const int* __restrict__ indices, const real* __restrict__ w,
+    const int* __restrict__ frontier, const int nf,
+    const real* __restrict__ X, const real* __restrict__ rhs, const real* __restrict__ diag,
+    const real delta, real* __restrict__ Y, unsigned char* __restrict__ changed)
+{{
+  ROW_SETUP
+  real acc[CPL];
+  #pragma unroll
+  for (int k = 0; k < CPL; ++k) acc[k] = 0;
+  for (int j = beg + e; j < end; j += LE) {{
+    const long long v = indices[j];
+    const real wv = w[j];
+    #pragma unroll
+    for (int k = 0; k < CPL; ++k) if (l + k * LC < NC) acc[k] += wv * X[v * NC + l + k * LC];
+  }}
+  #pragma unroll
+  for (int k = 0; k < CPL; ++k)
+    for (int off = LC; off < 32; off <<= 1) acc[k] += __shfl_xor_sync(0xffffffffu, acc[k], off);
+  bool ch = false;
+  if (e == 0) {{
+    const real inv = (real)1 / diag[row];
+    #pragma unroll
+    for (int k = 0; k < CPL; ++k) {{
+      const int c = l + k * LC;
+      if (c < NC) {{
+        const real yv = (rhs[(long long)row * NC + c] + acc[k]) * inv;
+        Y[wid * NC + c] = yv;
+        ch |= fabs(yv - X[(long long)row * NC + c]) > delta;
+      }}
+    }}
+  }}
+  const bool any = __any_sync(0xffffffffu, ch);
+  if (lane == 0) changed[wid] = any;
+}}
+
+extern "C" __global__ void push_scatter(
+    const int* __restrict__ indptr, const int* __restrict__ indices, const real* __restrict__ w,
+    const int* __restrict__ frontier, const int nf, const real* __restrict__ D,
+    real* __restrict__ R, unsigned char* __restrict__ mark)
+{{
+  ROW_SETUP
+  real d[CPL];
+  #pragma unroll
+  for (int k = 0; k < CPL; ++k) d[k] = l + k * LC < NC ? D[wid * NC + l + k * LC] : 0;
+  for (int j = beg + e; j < end; j += LE) {{
+    const long long v = indices[j];
+    const real wv = w[j];
+    #pragma unroll
+    for (int k = 0; k < CPL; ++k) if (l + k * LC < NC) atomicAdd(&R[v * NC + l + k * LC], wv * d[k]);
+    if (l == 0) mark[v] = 1;
+  }}
+}}
+
 """
 
 # Fused, asynchronous push: two kernels per round, no host sync per round.
@@ -224,12 +298,13 @@ extern "C" __global__ void compact_frontier(
 }}
 """
 
-MAX_KERNEL_COLS = 32
+MAX_KERNEL_COLS = 32  # row mapping keeps C accumulators per lane
+COLS_MIN = 17         # auto: class-parallel mapping above 16 columns (measured 1.5-2x at 24-32)
 _MODULES: dict = {}
 
 
 def _module(src, **fmt):
-    key = (src is _FUSED_SRC,) + tuple(sorted(fmt.items()))
+    key = (id(src),) + tuple(sorted(fmt.items()))
     if key not in _MODULES:
         import cupy
         _MODULES[key] = cupy.RawModule(code=src.format(**fmt), options=("--std=c++14",))
@@ -293,16 +368,21 @@ class FusedPush:
 class FrontierOps:
     """Frontier primitives bound to one CSR matrix and column count."""
 
-    def __init__(self, W, C, group="auto", threads=256):
+    def __init__(self, W, C, group="auto", threads=256, mapping="auto"):
         self.B, self.W, self.C, self.threads = backend.get(), W, C, threads
         self.gs = _group(W, group)
         self.real = np.float64 if W.data.dtype == np.float64 else np.float32
-        self.use_kernel = self.B.is_gpu and C <= MAX_KERNEL_COLS
+        self.mapping = mapping if mapping != "auto" else ("cols" if C >= COLS_MIN else "rows")
+        self.use_kernel = self.B.is_gpu and (self.mapping == "cols" or C <= MAX_KERNEL_COLS)
         self.edges = self.B.xp.zeros((), dtype=self.B.xp.int64)  # device-side edge-visit counter
 
     def _launch(self, name, ngroups, *args):
-        k = _module(_SRC, GS=self.gs, NC=self.C, REAL="double" if self.real is np.float64 else "float")
-        k = k.get_function(name)
+        real = "double" if self.real is np.float64 else "float"
+        if self.mapping == "cols" and name != "mark_neighbors":  # one warp per row
+            lc = min(32, 1 << max(self.C - 1, 0).bit_length())
+            k = _module(_COLS_SRC, NC=self.C, LC=lc, REAL=real).get_function(name)
+            return k(((ngroups * 32 + self.threads - 1) // self.threads,), (self.threads,), args)
+        k = _module(_SRC, GS=self.gs, NC=self.C, REAL=real).get_function(name)
         if self.gs > 32 and name == "frontier_jacobi":  # one block per row (DynLP's mapping)
             k((ngroups,), (self.gs,), args)
         else:
