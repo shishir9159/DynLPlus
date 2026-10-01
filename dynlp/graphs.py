@@ -1,30 +1,35 @@
-"""Graph datasets: synthetic generators and loaders.
+"""Graph datasets. A dataset is a symmetric, non-negative, loop-free CSR ``A`` with labels
+``y`` in [0, K) and an arrival ``order`` that the stream reveals vertices in.
 
-A dataset is a symmetric, non-negative, loop-free CSR ``A`` with labels ``y``
-in [0, K) and an arrival ``order`` that the stream reveals vertices in.
+imdb      the paper's IMDB graph: the 50K labeled reviews (Maas et al. 2011, Hugging Face
+          copy), TF-IDF, cosine kNN (k = 5), binary
+synth{K}  50K-vertex cosine kNN (k = 5) over a mixture with dense and sparse
+          sub-clusters, dense ones of different classes overlapping (K = 2 or 10)
+sbm, er   planted partition and Erdos-Renyi graphs for scale runs
 """
 from __future__ import annotations
 
-import gzip
-import io
+import math
 import os
+import re
 import shutil
 import urllib.request
-import zipfile
+from array import array
+from collections import Counter
 from dataclasses import dataclass
 
-import numpy as np
+from .backend import scatter_add, sp, xp
 
-from . import backend
+IMDB_URL = "https://huggingface.co/datasets/stanfordnlp/imdb/resolve/main/plain_text/{}-00000-of-00001.parquet"
 
 
 @dataclass
 class Dataset:
     name: str
-    A: object          # backend CSR (n x n), symmetric
-    y: object          # backend int32 (n,)
+    A: object      # CSR (n x n), symmetric
+    y: object      # int32 (n,)
     K: int
-    order: np.ndarray  # host int64 permutation, arrival order
+    order: object  # int64 permutation: arrival order
 
     n = property(lambda self: self.A.shape[0])
     nnz = property(lambda self: int(self.A.nnz))
@@ -32,9 +37,9 @@ class Dataset:
 
 def coalesce(rows, cols, vals, n, dtype):
     """Canonical CSR: duplicates summed, self-loops dropped."""
-    be, keep = backend.get(), rows != cols
-    i32 = be.xp.int32
-    coo = be.sp.coo_matrix((vals[keep].astype(dtype), (rows[keep].astype(i32), cols[keep].astype(i32))), shape=(n, n))
+    keep = rows != cols
+    coo = sp.coo_matrix((vals[keep].astype(dtype), (rows[keep].astype(xp.int32), cols[keep].astype(xp.int32))),
+                        shape=(n, n))
     coo.sum_duplicates()
     A = coo.tocsr()
     A.sum_duplicates()
@@ -42,31 +47,27 @@ def coalesce(rows, cols, vals, n, dtype):
 
 
 def symmetric_from_pairs(u, v, w, n, dtype):
-    xp = backend.get().xp
     return coalesce(xp.concatenate([u, v]), xp.concatenate([v, u]), xp.concatenate([w, w]), n, dtype)
 
 
 def expand_counts(counts, nseg):
-    """Segment id of each element given per-segment counts (np.repeat(arange, counts))."""
-    be = backend.get()
-    xp = be.xp
+    """Segment id of each element given per-segment counts (repeat(arange, counts))."""
     total = int(counts.sum())
     if not total:
         return xp.zeros(0, dtype=xp.int32)
     nz = counts > 0
     marks = xp.zeros(total + 1, dtype=xp.int32)
-    be.scatter_add(marks, (xp.cumsum(counts) - counts)[nz].astype(xp.int64), xp.int32(1))
+    scatter_add(marks, (xp.cumsum(counts) - counts)[nz].astype(xp.int64), xp.int32(1))
     return xp.flatnonzero(nz).astype(xp.int32)[xp.cumsum(marks[:total]) - 1]  # k-th non-empty -> id
 
 
 def csr_rows(A):
-    """Row index of every stored entry (COO rows) of a CSR matrix."""
-    return expand_counts(backend.get().xp.diff(A.indptr), A.shape[0])
+    """Row index of every stored entry of a CSR matrix."""
+    return expand_counts(xp.diff(A.indptr), A.shape[0])
 
 
 def row_positions(indptr, rows):
     """Positions of all stored entries in the given CSR rows, and each one's segment index."""
-    xp = backend.get().xp
     rows = rows.astype(xp.int64)
     counts = (indptr[rows + 1] - indptr[rows]).astype(xp.int64)
     seg = expand_counts(counts, int(rows.shape[0]))
@@ -76,15 +77,31 @@ def row_positions(indptr, rows):
     return indptr[rows].astype(xp.int64)[seg] + (xp.arange(seg.shape[0], dtype=xp.int64) - excl[seg]), seg
 
 
-def _setup(seed):
-    xp = backend.get().xp
-    return xp, xp.random.RandomState(seed), lambda n: np.random.RandomState(seed + 1).permutation(n)
+def knn_graph(X, k, dtype):
+    """Symmetric cosine kNN graph of the L2-normalized rows of X (dense or CSR); a pair
+    found from both sides is kept once, so weights stay cosine similarities."""
+    n = X.shape[0]
+    chunk = max(1, min(n, (1 << 26) // n))
+    nbr, sim = xp.empty((n, k), dtype=xp.int64), xp.empty((n, k), dtype=xp.float32)
+    for s in range(0, n, chunk):
+        e = min(n, s + chunk)
+        S = (X @ X[s:e].toarray().T).T if sp.issparse(X) else X[s:e] @ X.T
+        S = xp.ascontiguousarray(S, dtype=xp.float32)
+        S[xp.arange(e - s), xp.arange(s, e)] = -xp.inf
+        nbr[s:e] = idx = xp.argpartition(-S, k, axis=1)[:, :k]
+        sim[s:e] = xp.take_along_axis(S, idx, axis=1)
+    u, v = xp.repeat(xp.arange(n, dtype=xp.int64), k), nbr.ravel()
+    _, first = xp.unique(xp.minimum(u, v) * n + xp.maximum(u, v), return_index=True)
+    return symmetric_from_pairs(u[first], v[first], xp.clip(sim.ravel()[first], 1e-3, None), n, dtype)
+
+
+def _rng(seed):
+    return xp.random.RandomState(seed), xp.random.RandomState(seed + 1).permutation
 
 
 def sbm(n, K=2, deg=10.0, p_in=0.85, seed=0, dtype="float32") -> Dataset:
-    """Planted partition: a p_in share of edges stays inside a class; intra-class
-    edges are heavier (like a similarity graph), so tau-sparsification behaves."""
-    xp, rs, order = _setup(seed)
+    """Planted partition: a p_in share of edges stays inside a class; intra-class edges are heavier."""
+    rs, perm = _rng(seed)
     y = rs.randint(0, K, size=n).astype(xp.int32)
     members, sizes = xp.argsort(y).astype(xp.int64), xp.bincount(y, minlength=K).astype(xp.int64)
     offs, m = xp.cumsum(sizes) - sizes, int(n * deg / 2)
@@ -94,40 +111,38 @@ def sbm(n, K=2, deg=10.0, p_in=0.85, seed=0, dtype="float32") -> Dataset:
     v_in = members[offs[yu] + (rs.random_sample(m) * sizes[yu]).astype(xp.int64)]
     v = xp.where(intra, v_in, rs.randint(0, n, size=m).astype(xp.int64))
     w = xp.where(y[u] == y[v], 0.4 + 0.6 * rs.random_sample(m), 0.1 + 0.6 * rs.random_sample(m))
-    return Dataset(f"sbm-n{n}-K{K}-d{deg:g}", symmetric_from_pairs(u, v, w, n, dtype), y, K, order(n))
+    return Dataset(f"sbm-n{n}-K{K}-d{deg:g}", symmetric_from_pairs(u, v, w, n, dtype), y, K, perm(n))
 
 
 def erdos_renyi(n, K=2, deg=5.0, seed=0, dtype="float32") -> Dataset:
     """The paper's 'Random' dataset: uniform edges, labels without structure."""
-    xp, rs, order = _setup(seed)
+    rs, perm = _rng(seed)
     m = int(n * deg / 2)
     u, v = rs.randint(0, n, size=m).astype(xp.int64), rs.randint(0, n, size=m).astype(xp.int64)
     A = symmetric_from_pairs(u, v, 0.1 + 0.9 * rs.random_sample(m), n, dtype)
-    return Dataset(f"er-n{n}-d{deg:g}", A, rs.randint(0, K, size=n).astype(xp.int32), K, order(n))
+    return Dataset(f"er-n{n}-d{deg:g}", A, rs.randint(0, K, size=n).astype(xp.int32), K, perm(n))
 
 
-def gmm_knn(n, K=2, dim=32, k=10, sep=2.0, seed=0, dtype="float32") -> Dataset:
-    """kNN cosine-similarity graph over a Gaussian mixture (brute force; n <= ~2e5)."""
-    xp, rs, order = _setup(seed)
-    y = rs.randint(0, K, size=n).astype(xp.int32)
-    means = rs.standard_normal((K, dim)) * sep / np.sqrt(dim) * 3.0
-    X = (means[y] + rs.standard_normal((n, dim))).astype(xp.float32)
+def synth(n=50_000, K=10, k=5, dim=16, subs=5, seed=0, dtype="float32") -> Dataset:
+    """Mixture built to stress DynLP step 1. Each class has `subs` sub-clusters with spreads
+    spanning 8x (dense and sparse regions, so similarity scales differ by region), and a
+    quarter of the densest sub-clusters overlap a dense one of another class (so a global
+    threshold chains them). Cosine kNN, k = 5, like the paper's graphs."""
+    rs, perm = _rng(seed)
+    S = K * subs
+    centers = rs.standard_normal((S, dim)).astype(xp.float32)
+    centers *= 10 / xp.linalg.norm(centers, axis=1, keepdims=True)
+    spread = (0.4 * 8 ** rs.random_sample(S)).astype(xp.float32)
+    dense = xp.argsort(spread)[: max(2, S // 4)]
+    for a in dense.tolist():  # a dense sub-cluster of another class overlapping `a`
+        b = (a + subs * int(rs.randint(1, K))) % S if K > 1 else a
+        step = rs.standard_normal(dim).astype(xp.float32)
+        spread[b] = spread[a]
+        centers[b] = centers[a] + step / xp.linalg.norm(step) * spread[a] * dim ** 0.5
+    sub = rs.randint(0, S, size=n)
+    X = centers[sub] + spread[sub, None] * rs.standard_normal((n, dim)).astype(xp.float32)
     X /= xp.linalg.norm(X, axis=1, keepdims=True)
-    nbr, sim = xp.empty((n, k), dtype=xp.int64), xp.empty((n, k), dtype=xp.float32)
-    chunk = max(1, min(n, (1 << 26) // n))
-    for s in range(0, n, chunk):
-        e = min(n, s + chunk)
-        S = X[s:e] @ X.T
-        S[xp.arange(e - s), xp.arange(s, e)] = -xp.inf
-        nbr[s:e] = idx = xp.argpartition(-S, k, axis=1)[:, :k]
-        sim[s:e] = xp.take_along_axis(S, idx, axis=1)
-    u = xp.repeat(xp.arange(n, dtype=xp.int64), k)
-    A = symmetric_from_pairs(u, nbr.ravel(), xp.clip(sim.ravel(), 1e-3, None), n, dtype)
-    return Dataset(f"gmmknn-n{n}-K{K}-k{k}", A, y, K, order(n))
-
-
-_OGB = {name: f"http://snap.stanford.edu/ogb/data/nodeproppred/{name[5:]}.zip"
-        for name in ("ogbn-arxiv", "ogbn-products")}
+    return Dataset(f"synth{K}", knn_graph(X, k, dtype), (sub // subs).astype(xp.int32), K, perm(n))
 
 
 def _download(url, path, timeout=60):
@@ -142,87 +157,81 @@ def _download(url, path, timeout=60):
             os.remove(path + ".part")
 
 
-def _read_csv_gz(zf, member, dtype):
-    with zf.open(member) as fh:
-        raw = io.BytesIO(gzip.decompress(fh.read()))
-    try:
-        import pandas as pd
-        return pd.read_csv(raw, header=None).to_numpy(dtype=dtype)
-    except ImportError:
-        return np.loadtxt(raw, delimiter=",", dtype=dtype, ndmin=2)
+def tfidf(docs, min_df=5, max_df=0.5):
+    """L2-normalized TF-IDF CSR (sublinear tf, smooth idf) of tokenized documents."""
+    df = Counter(t for d in docs for t in set(d))
+    vocab = {t: i for i, t in enumerate(t for t, c in df.items() if min_df <= c <= max_df * len(docs))}
+    rows, cols, vals = array("i"), array("i"), array("f")
+    for r, d in enumerate(docs):
+        for t, c in Counter(t for t in d if t in vocab).items():
+            rows.append(r), cols.append(vocab[t])
+            vals.append((1 + math.log(c)) * (math.log((1 + len(docs)) / (1 + df[t])) + 1))
+    rows, cols, vals = xp.asarray(rows), xp.asarray(cols), xp.asarray(vals)
+    norm = xp.zeros(len(docs), dtype=xp.float32)
+    scatter_add(norm, rows, vals * vals)
+    vals /= xp.sqrt(xp.maximum(norm, 1e-12))[rows]
+    return sp.coo_matrix((vals, (rows, cols)), shape=(len(docs), len(vocab))).tocsr()
 
 
-def ogbn(name, data_dir="data", seed=0, dtype="float32") -> Dataset:
-    """ogbn-arxiv (arrival by publication year) or ogbn-products; unweighted, symmetrized.
-    Downloads the raw OGB zip once and caches a compact .npz next to it."""
-    xp = backend.get().xp
+def _imdb_reviews(data_dir):
+    """(tokens, labels) of the 25K train + 25K test labeled reviews (downloads ~41 MB once)."""
+    import pandas as pd
+    word, docs, ys = re.compile(r"\b\w\w+\b"), [], []
+    for split in ("train", "test"):
+        path = os.path.join(data_dir, f"imdb-{split}.parquet")
+        if not os.path.exists(path):
+            _download(IMDB_URL.format(split), path)
+        df = pd.read_parquet(path)
+        docs += [word.findall(t.lower().replace("<br />", " ")) for t in df.text]
+        ys += df.label.tolist()
+    return docs, ys
+
+
+def _cached(path, build):
+    """Load an edge-list cache (src, dst, w, y), building it first if missing."""
+    if not os.path.exists(path):
+        A, y = build()
+        r = csr_rows(A)
+        up = r < A.indices
+        xp.savez(path, src=r[up], dst=A.indices[up], w=A.data[up], y=y)
+    z = xp.load(path)
+    return z["src"], z["dst"], z["w"], z["y"]
+
+
+def from_npz(path, dtype="float32", seed=0, name=None) -> Dataset:
+    """Edge-list npz with src, dst, y and optional w, order (bring your own graph too)."""
+    z = xp.load(path)
+    keys = set(z.npz_file.files)
+    n, y = int(z["y"].shape[0]), z["y"].astype(xp.int32)
+    w = z["w"] if "w" in keys else xp.ones(z["src"].shape[0])
+    A = symmetric_from_pairs(z["src"].astype(xp.int64), z["dst"].astype(xp.int64), w, n, dtype)
+    order = z["order"] if "order" in keys else xp.random.RandomState(seed + 1).permutation(n)
+    return Dataset(name or os.path.basename(path), A, y, int(y.max()) + 1, order)
+
+
+def build_cached(spec, data_dir="data"):
+    """Build data/<spec>.npz if missing: imdb (downloads ~41 MB once), synth2, synth10."""
     os.makedirs(data_dir, exist_ok=True)
-    cache = os.path.join(data_dir, f"{name}.npz")
-    if not os.path.exists(cache):
-        zpath = os.path.join(data_dir, os.path.basename(_OGB[name]))
-        if not os.path.exists(zpath):
-            _download(_OGB[name], zpath)
-        with zipfile.ZipFile(zpath) as zf:
-            names = zf.namelist()
-            read = lambda s, dt: _read_csv_gz(zf, next(m for m in names if m.endswith(s)), dt)[:, :2]  # noqa: E731
-            edges = read("raw/edge.csv.gz", np.int64)
-            labels = np.nan_to_num(read("raw/node-label.csv.gz", np.float64)[:, 0], nan=-1).astype(np.int32)
-            has_year = any(m.endswith("raw/node_year.csv.gz") for m in names)
-            year = read("raw/node_year.csv.gz", np.int64)[:, 0] if has_year else np.zeros(0, np.int64)
-        np.savez(cache, src=edges[:, 0], dst=edges[:, 1], y=labels, year=year)
-    z = np.load(cache)
-    n, src = int(z["y"].shape[0]), xp.asarray(z["src"])
-    A = symmetric_from_pairs(src, xp.asarray(z["dst"]), xp.ones(src.shape[0], dtype=dtype), n, dtype)
-    A.data[:] = 1.0  # u->v and v->u collapse to weight 1
-    rs = np.random.RandomState(seed + 1)
-    order = np.lexsort((rs.random_sample(n), z["year"])) if z["year"].size else rs.permutation(n)
-    return Dataset(name, A, xp.asarray(z["y"]), int(z["y"].max()) + 1, order)
+    path = os.path.join(data_dir, f"{spec}.npz")
+    if spec == "imdb":
+        def build():
+            docs, y = _imdb_reviews(data_dir)
+            return knn_graph(tfidf(docs), 5, "float32"), xp.asarray(y, dtype=xp.int32)
+    elif spec.startswith("synth"):
+        def build():
+            ds = synth(K=int(spec[5:]))
+            return ds.A, ds.y
+    else:
+        raise ValueError(f"unknown dataset {spec!r}")
+    _cached(path, build)
+    return path
 
 
-def from_npz(path, dtype="float32", seed=0) -> Dataset:
-    """Bring your own graph: npz with src, dst, y and optional w, order."""
-    xp, z = backend.get().xp, np.load(path)
-    n = int(z["y"].shape[0])
-    w = z["w"] if "w" in z else np.ones(z["src"].shape[0])
-    A = symmetric_from_pairs(xp.asarray(z["src"]), xp.asarray(z["dst"]), xp.asarray(w), n, dtype)
-    order = z["order"] if "order" in z else np.random.RandomState(seed + 1).permutation(n)
-    return Dataset(os.path.basename(path), A, xp.asarray(z["y"].astype(np.int32)), int(z["y"].max()) + 1, order)
-
-
-def reorder_graph(ds: Dataset, method="rcm") -> Dataset:
-    """Relabel vertices by reverse Cuthill-McKee so neighbours get nearby ids (the graph
-    analogue of sliding-window attention): gathers reuse cache lines the previous row
-    loaded. Measured 1.15-1.3x on full sweeps of a kNN graph, nothing on small frontiers."""
-    if method == "none":
-        return ds
-    if method != "rcm":
-        raise ValueError(f"unknown reorder {method!r}")
-    import scipy.sparse as ssp
-    from scipy.sparse.csgraph import reverse_cuthill_mckee
-    be = backend.get()
-    xp, A = be.xp, ds.A
-    H = ssp.csr_matrix((be.asnumpy(A.data), be.asnumpy(A.indices), be.asnumpy(A.indptr)), shape=A.shape)
-    p = reverse_cuthill_mckee(H, symmetric_mode=True).astype(np.int64)
-    inv = np.empty_like(p)
-    inv[p] = np.arange(p.shape[0])
-    H = H[p][:, p].tocsr()
-    H.sort_indices()
-    A = be.csr(xp.asarray(H.data), xp.asarray(H.indices), xp.asarray(H.indptr), H.shape)
-    return Dataset(f"{ds.name}-{method}", A, ds.y[xp.asarray(p)], ds.K, inv[ds.order])
-
-
-def load(spec: str, *, n=100_000, K=2, deg=10.0, p_in=0.85, knn=10, dim=32, seed=0, dtype="float32",
-         data_dir="data", reorder="none") -> Dataset:
-    return reorder_graph(_load(spec, n, K, deg, p_in, knn, dim, seed, dtype, data_dir), reorder)
-
-
-def _load(spec, n, K, deg, p_in, knn, dim, seed, dtype, data_dir) -> Dataset:
-    makers = {"sbm": lambda: sbm(n, K, deg, p_in, seed, dtype), "er": lambda: erdos_renyi(n, K, deg, seed, dtype),
-              "gmm-knn": lambda: gmm_knn(n, K, dim, knn, seed=seed, dtype=dtype)}
-    if spec in makers:
-        return makers[spec]()
-    if spec in _OGB:
-        return ogbn(spec, data_dir, seed, dtype)
+def load(spec: str, *, n=100_000, K=2, deg=10.0, p_in=0.85, seed=0, dtype="float32", data_dir="data") -> Dataset:
+    if spec == "sbm":
+        return sbm(n, K, deg, p_in, seed, dtype)
+    if spec == "er":
+        return erdos_renyi(n, K, deg, seed, dtype)
     if spec.endswith(".npz"):
         return from_npz(spec, dtype, seed)
-    raise ValueError(f"unknown dataset {spec!r}")
+    return from_npz(build_cached(spec, data_dir), dtype, seed, name=spec)

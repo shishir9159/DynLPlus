@@ -20,3 +20,4 @@ results/h100/
 results/*.tar.gz
 results/sanity/
 results/*.log
+results/profile/

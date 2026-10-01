@@ -1,17 +1,17 @@
-# DynLP+ experiments on one H100 (80 GB). `just` lists recipes; OUT=... just e3
+# DynLP+ method comparison on one GPU (H100). `just` lists recipes; each run ends in results/<dir>/matrix.md
 set shell := ["bash", "-euo", "pipefail", "-c"]
 
 export PATH := env("HOME", "~") + "/.local/bin:" + env("PATH")
-OUT := env("OUT", "results/h100")
 # CuPy extra matching the driver: nvidia-smi prints "CUDA Version: 12.8" or "CUDA UMD Version: 13.4"
 _cu := `v=$(nvidia-smi 2>/dev/null | grep -oE 'CUDA (UMD )?Version: [0-9]+' | grep -oE '[0-9]+$' | head -1 || true); [ "${v:-12}" -ge 13 ] && echo cu13 || echo cu12`
 CU := env("CU", _cu)
 py := "uv run --no-sync python"
-b := py + " -m dynlp.bench --backend cupy"
-kb := py + " -m dynlp.kernelbench --fracs 0.001,0.01,0.1,1.0 --groups 1,2,4,8,16,32,128,256,cols"
-sbm := "--dataset sbm --deg 10"
-all_s := "itlp,itlp-warm,dynlp,dynlp-knowninit,dynlp+push,dynlp+pcg,dynlp+amg,dynlp+auto"
-big_s := "itlp,itlp-warm,dynlp,dynlp-knowninit,dynlp+pcg,dynlp+amg,dynlp+auto"
+b := py + " -m dynlp.bench"
+kb := py + " -m dynlp.kernelbench"
+methods := "itlp,dynlp,dynlp-fh,dynlp+pcg,dynlp+amg,dynlp+auto"
+resident := "dynlp,dynlp-fh,dynlp+auto,dynlp+inc"
+# run NAME CMD...: log to $o/NAME.log, time it, show the summary
+_run := 'run() { local n=$1 s=$(date +%s); shift; "$@" > $o/$n.log 2>&1; local rc=$?; echo "$n $(( $(date +%s) - s ))s exit=$rc" | tee -a $o/stages.log; tail -n 10 $o/$n.log; }'
 
 default:
     @just --list
@@ -24,121 +24,55 @@ setup:
     uv run --no-sync pytest -q
 
 test *args:
-    uv run pytest -q {{args}}
+    uv run --no-sync pytest -q {{args}}
 
-[private]
-dirs:
-    mkdir -p {{OUT}} data
+# the paper's IMDB graph (downloads ~41 MB once) and the generated synth2 / synth10 -> data/*.npz
+data:
+    {{py}} -c "from dynlp import graphs; [print(graphs.build_cached(d)) for d in ('imdb', 'synth2', 'synth10')]"
 
-# 2-minute end-to-end check
-smoke: dirs
-    {{b}} {{sbm}} --n 100000 --batches 3 --solvers {{all_s}} --out {{OUT}}/smoke.csv --tag smoke
-
-# kernel mapping: sub-warp vs block-per-row
-e1: dirs
-    {{kb}} {{sbm}} --n 20000000 --cols 1,2,8,32 --out {{OUT}}/e1_kernels_sbm20m.csv
-    {{kb}} --dataset er --n 50000000 --deg 5 --cols 1,2 --out {{OUT}}/e1_kernels_er50m.csv
-    {{kb}} {{sbm}} --n 5000000 --cols 16,32,64 --fracs 0.01,1.0 --groups 8,32,cols --out {{OUT}}/e1_kernels_classes.csv
-    for r in none rcm; do {{kb}} --dataset ogbn-products --cols 1,47 --fracs 0.01,1.0 --groups 8,cols --reorder $r --out {{OUT}}/e1_kernels_products_$r.csv; done
-
-# paper's single batch on the 50M random graph
-e2: dirs
-    {{b}} --dataset er --n 50000000 --deg 5 --init-frac 1.0 --batches 0 --solvers itlp,dynlp,dynlp+pcg,dynlp+amg --out {{OUT}}/e2_er50m_single.csv --tag e2
-
-# streaming, binary; then small local batches (push path)
-e3: dirs
-    {{b}} {{sbm}} --n 10000000 --batches 10 --solvers {{big_s}} --out {{OUT}}/e3_sbm10m.csv --tag e3
-    {{b}} {{sbm}} --n 30000000 --batches 10 --solvers itlp-warm,dynlp,dynlp+pcg,dynlp+amg,dynlp+auto --out {{OUT}}/e3_sbm30m.csv --tag e3
-    {{b}} {{sbm}} --n 10000000 --init-frac 0.9 --batches 100 --del-frac 0.1 --solvers dynlp,dynlp+push,dynlp+amg,dynlp+auto --out {{OUT}}/e3_sbm10m_small.csv --tag e3small
-
-# accuracy/time: sweep delta (DynLP/ItLP) and tol (DynLP+); float64 below the float32 floor
-e4: dirs
-    for d in 1e-2 1e-3 1e-4 1e-5 1e-6; do {{b}} {{sbm}} --n 5000000 --batches 10 --solvers itlp-warm,dynlp --delta $d --out {{OUT}}/e4_sweep.csv --tag delta=$d; done
-    for t in 1e-2 1e-3 1e-4; do {{b}} {{sbm}} --n 5000000 --batches 10 --solvers dynlp+pcg,dynlp+amg,dynlp+auto --tol $t --out {{OUT}}/e4_sweep.csv --tag tol=$t; done
-    {{b}} {{sbm}} --n 5000000 --batches 10 --solvers dynlp+amg,dynlp+auto --tol 1e-6 --dtype float64 --out {{OUT}}/e4_sweep.csv --tag tol=1e-6,f64
-
-# multi-class: SBM K=4/16/64, ogbn-arxiv, ogbn-products
-e5: dirs
-    for K in 4 16 64; do {{b}} {{sbm}} --n 2000000 --classes $K --batches 10 --solvers itlp-warm,dynlp,dynlp+pcg,dynlp+amg,dynlp+auto --out {{OUT}}/e5_sbm_K$K.csv --tag K=$K; done
-    {{b}} --dataset ogbn-arxiv --data-dir data --batches 10 --init-frac 0.3 --solvers itlp,itlp-warm,dynlp,dynlp+pcg,dynlp+amg,dynlp+auto --out {{OUT}}/e5_arxiv.csv --tag arxiv
-    {{b}} --dataset ogbn-products --data-dir data --batches 10 --solvers itlp-warm,dynlp,dynlp+pcg,dynlp+amg,dynlp+auto --out {{OUT}}/e5_products.csv --tag products
-
-# nsys/ncu profiles of the frontier kernels and the PCG/AMG loop
-e6: dirs
-    nsys profile -o {{OUT}}/e6_nsys --force-overwrite true --trace=cuda,nvtx {{b}} {{sbm}} --n 5000000 --batches 3 --solvers dynlp,dynlp+auto --no-reference --no-warmup
-    ncu --set full -k regex:frontier_jacobi --launch-count 5 -o {{OUT}}/e6_ncu -f {{b}} {{sbm}} --n 5000000 --batches 1 --solvers dynlp --no-reference --no-warmup
-
-# resident state: per-batch cost against the size of the change, then correctness
-e7: dirs
-    for nb in 10 100 400; do \
-      {{b}} {{sbm}} --n 10000000 --init-frac 0.95 --batches $nb --solvers dynlp,dynlp+auto --no-reference --out {{OUT}}/e7_rebuild.csv --tag batches=$nb; \
-      {{b}} --incremental {{sbm}} --n 10000000 --init-frac 0.95 --batches $nb --solvers dynlp,dynlp+auto,dynlp+inc --no-reference --out {{OUT}}/e7_resident.csv --tag batches=$nb; \
-    done
-    {{b}} --incremental {{sbm}} --n 1000000 --init-frac 0.95 --batches 20 --solvers dynlp+inc --out {{OUT}}/e7_check.csv --tag check
-
-figs:
-    for f in {{OUT}}/e3_*.csv {{OUT}}/e5_*.csv {{OUT}}/smoke.csv; do [ ! -f $f ] || {{py}} scripts/plot_results.py $f --outdir {{OUT}}/fig; done
-    [ ! -f {{OUT}}/e4_sweep.csv ] || {{py}} scripts/plot_results.py {{OUT}}/e4_sweep.csv --pareto --outdir {{OUT}}/fig
-    for f in {{OUT}}/e1_*.csv; do [ ! -f $f ] || {{py}} scripts/plot_results.py --kernels $f --outdir {{OUT}}/fig; done
-
-# e1..e5, e7 and figures (several hours)
-all: smoke e1 e2 e3 e4 e5 e7 figs
-
-# ~10-minute check of every experiment at small scale, no downloads: results/sanity.tar.gz
-sanity:
+# ~10 min: every method on IMDB, synth2, synth10, SBM 1M; resident path; kernels -> results/sanity/matrix.md
+sanity: data
     #!/usr/bin/env bash
     set -uo pipefail
-    o=results/sanity && rm -rf $o && mkdir -p $o {{OUT}}/.done && T0=$(date +%s)
-    [ -f {{OUT}}/.done/setup ] || { just setup && touch {{OUT}}/.done/setup; } || exit 1
-    run() { local n=$1 s=$(date +%s); shift; "$@" > $o/$n.log 2>&1; local rc=$?
-            echo "$n $(( $(date +%s) - s ))s exit=$rc" | tee -a $o/stages.log; tail -n 6 $o/$n.log; }
-    run e2 {{b}} --dataset er --n 2000000 --deg 5 --init-frac 1.0 --batches 0 --solvers itlp,dynlp,dynlp+pcg --out $o/e2_er2m.csv
-    for p in "1e-4 1e-3" "1e-6 1e-4"; do set -- $p
-      run e4_$1 {{b}} {{sbm}} --n 500000 --batches 5 --solvers dynlp,dynlp+pcg --delta $1 --tol $2 --out $o/e4_sweep.csv --tag "delta=$1,tol=$2"; done
-    run e7_rebuild {{b}} {{sbm}} --n 1000000 --init-frac 0.95 --batches 20 --solvers dynlp,dynlp+auto --no-reference --out $o/e7_rebuild.csv
-    run e7_resident {{b}} --incremental {{sbm}} --n 1000000 --init-frac 0.95 --batches 20 --solvers dynlp+auto,dynlp+inc --no-reference --out $o/e7_resident.csv
-    run e7_check {{b}} --incremental {{sbm}} --n 200000 --init-frac 0.9 --batches 10 --solvers dynlp+inc --out $o/e7_check.csv
-    run e5_sbm {{b}} {{sbm}} --n 500000 --classes 16 --batches 3 --solvers dynlp,dynlp+pcg --out $o/e5_sbm_K16.csv
-    run e5_knn {{b}} --dataset gmm-knn --n 100000 --classes 40 --init-frac 0.5 --batches 3 --solvers dynlp,dynlp+pcg --out $o/e5_knn_K40.csv
-    run e1 {{kb}} {{sbm}} --n 2000000 --cols 2,32 --fracs 0.01,1.0 --groups 8,32,128,cols --reps 5 --out $o/e1_kernels.csv
-    just --set OUT $o figs > $o/figs.log 2>&1
-    tar czf results/sanity.tar.gz $o && echo "total $(( $(date +%s) - T0 ))s -> results/sanity.tar.gz"
+    o=results/sanity && rm -rf $o && mkdir -p $o && T0=$(date +%s) && {{_run}}
+    for d in imdb synth2 synth10; do run $d {{b}} --dataset $d --batches 5 --solvers {{methods}} --out $o/$d.csv; done
+    run imdb-resident {{b}} --incremental --dataset imdb --init-frac 0.9 --batches 20 --solvers {{resident}} --out $o/imdb_resident.csv --tag imdb-resident
+    run sbm {{b}} --dataset sbm --n 1000000 --batches 5 --solvers {{methods}} --out $o/sbm1m.csv
+    run kernels {{kb}} --n 500000 --cols 2,32 --reps 5 --out $o/kernels.csv
+    just matrix $o
+    echo "total $(( $(date +%s) - T0 ))s -> $o/matrix.md"
 
-# download OGB data up front, so rented GPU time isn't spent on it
-data: dirs
-    {{py}} -c "from dynlp import backend, graphs; backend.set_backend('numpy'); [graphs.ogbn(d) for d in ('ogbn-arxiv', 'ogbn-products')]"
-
-# rented GPU: setup, then stages by priority until the time box runs out; resumable; ends with a tarball
-rent hours="6" stages="smoke e2 e4 e3 e7 e5 e1 e6":
+# the full method matrix (about 1-2 h on an H100) -> results/compare/matrix.md
+compare: data
     #!/usr/bin/env bash
     set -uo pipefail
-    mkdir -p {{OUT}}/.done && log={{OUT}}/stages.log && end=$(( $(date +%s) + {{hours}} * 3600 ))
-    [ -f {{OUT}}/.done/setup ] || { just setup && just data && touch {{OUT}}/.done/setup; } || exit 1
-    for s in {{stages}}; do
-      [ -f {{OUT}}/.done/$s ] && { echo "skip $s (done)"; continue; }
-      [ $(date +%s) -lt $end ] || { echo "time box reached; left: $s ..."; break; }
-      rm -f {{OUT}}/${s}_*.csv {{OUT}}/$s.csv; t0=$(date +%s)
-      just $s; rc=$?
-      echo "$s $(date -d @$t0 '+%F %T') $(( $(date +%s) - t0 ))s exit=$rc" | tee -a $log
-      [ $rc -eq 0 ] && touch {{OUT}}/.done/$s
-    done
-    just figs; just pack
+    o=results/compare && mkdir -p $o && rm -f $o/*.csv $o/stages.log && {{_run}}
+    run imdb-single {{b}} --dataset imdb --init-frac 1.0 --batches 0 --solvers {{methods}} --out $o/imdb_single.csv --tag imdb-single
+    for d in imdb synth2 synth10; do run $d {{b}} --dataset $d --batches 10 --solvers {{methods}} --out $o/$d.csv; done
+    run imdb-resident {{b}} --incremental --dataset imdb --init-frac 0.9 --batches 100 --solvers {{resident}} --out $o/imdb_resident.csv --tag imdb-resident
+    run er50m {{b}} --dataset er --n 50000000 --deg 5 --init-frac 1.0 --batches 0 --solvers itlp,dynlp,dynlp+pcg,dynlp+amg --out $o/er50m.csv --tag er50m-single
+    run sbm10m {{b}} --dataset sbm --n 10000000 --batches 10 --solvers {{methods}} --out $o/sbm10m.csv --tag sbm10m
+    run sbm-k16 {{b}} --dataset sbm --n 2000000 --classes 16 --batches 10 --solvers {{methods}} --out $o/sbm2m_k16.csv --tag sbm2m-K16
+    run sbm-resident {{b}} --incremental --dataset sbm --n 10000000 --init-frac 0.95 --batches 100 --solvers {{resident}} --no-reference --out $o/sbm10m_resident.csv --tag sbm10m-resident
+    just matrix $o
 
-# same as rent, detached from the SSH session; follow with `just status`
-rent-bg hours="6":
-    mkdir -p {{OUT}} && nohup just rent {{hours}} > {{OUT}}/rent.log 2>&1 &
-    @echo "running in the background: tail -f {{OUT}}/rent.log"
+# kernel mappings vs cuSPARSE and our row-major SpMM, all rows, 2..64 columns
+kernels:
+    mkdir -p results/kernels
+    {{kb}} --dataset sbm --n 20000000 --cols 2,16,32,64 --out results/kernels/sbm20m.csv
+    {{kb}} --dataset er --n 50000000 --deg 5 --cols 2,16 --out results/kernels/er50m.csv
 
-# what finished, how long it took, and the last log lines
-status:
-    @echo "done: $(ls {{OUT}}/.done 2>/dev/null | xargs)"; cat {{OUT}}/stages.log 2>/dev/null; tail -n 5 {{OUT}}/rent.log 2>/dev/null || true
+# nsys timeline and ncu report of the frontier kernel
+profile:
+    mkdir -p results/profile
+    nsys profile -o results/profile/nsys --force-overwrite true --trace=cuda,nvtx {{b}} --dataset sbm --n 5000000 --batches 3 --solvers dynlp,dynlp+auto --no-reference --no-warmup
+    ncu --set full -k regex:frontier_jacobi --launch-count 5 -o results/profile/ncu -f {{b}} --dataset sbm --n 5000000 --batches 1 --solvers dynlp --no-reference --no-warmup
 
-# results/h100.tar.gz: CSVs, configs, figures and logs (no profiles); copy it back before the box goes away
-pack:
-    tar czf results/h100.tar.gz --exclude='*.nsys-rep' --exclude='*.ncu-rep' {{OUT}}
-    @echo "scp $(whoami)@$(hostname -I 2>/dev/null | cut -d' ' -f1):$(pwd)/results/h100.tar.gz ."
+# matrix.md / matrix.csv and figures for a results directory
+matrix dir="results/sanity":
+    {{py}} scripts/matrix.py {{dir}}
+    {{py}} scripts/plot_results.py {{dir}} > /dev/null
 
-# submit a stage to SLURM (add --partition/--account for your site)
-slurm stage="all":
-    mkdir -p results
-    sbatch -J dynlp-plus --gres=gpu:h100:1 -c 16 --mem=128G -t 08:00:00 -o results/slurm-%j.out --wrap "nvidia-smi && just {{stage}}"
+# results/<name>.tar.gz of a results directory (no profiles)
+pack dir="results/compare":
+    tar czf {{dir}}.tar.gz --exclude='*.nsys-rep' --exclude='*.ncu-rep' {{dir}} && echo {{dir}}.tar.gz

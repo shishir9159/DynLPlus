@@ -7,9 +7,7 @@ CPU (and GPU with many columns): vectorized SciPy/CuPy fallbacks.
 """
 from __future__ import annotations
 
-import numpy as np
-
-from . import backend
+from .backend import scatter_add, xp
 
 _SRC = r"""
 #define GS {GS}
@@ -360,8 +358,7 @@ _MODULES: dict = {}
 def _module(src, **fmt):
     key = (id(src),) + tuple(sorted(fmt.items()))
     if key not in _MODULES:
-        import cupy
-        _MODULES[key] = cupy.RawModule(code=src.format(**fmt), options=("--std=c++14",))
+        _MODULES[key] = xp.RawModule(code=src.format(**fmt), options=("--std=c++14",))
     return _MODULES[key]
 
 
@@ -381,13 +378,12 @@ def spmm_axpy(W, X, a=None, b=1.0, group="auto"):
     """a * X + b * (W @ X) for row-major X (n x C, C >= 2) on the GPU, in one pass.
     cuSPARSE's csrmm wants column-major X, and the conversion plus column-wise
     gathers made it 2-25x slower than this kernel (Sputnik's row-major SpMM)."""
-    import cupy
     n, C = W.shape[0], X.shape[1]
-    X = cupy.ascontiguousarray(X)
-    Y = cupy.empty((n, C), dtype=X.dtype)
-    real = "double" if X.dtype == np.float64 else "float"
-    rb = (np.float64 if X.dtype == np.float64 else np.float32)(b)
-    args = (W.indptr, W.indices, W.data, np.int32(n), X, a if a is not None else np.uint64(0), rb, Y)  # 0: null
+    X = xp.ascontiguousarray(X)
+    Y = xp.empty((n, C), dtype=X.dtype)
+    real = "double" if X.dtype == xp.float64 else "float"
+    rb = (xp.float64 if X.dtype == xp.float64 else xp.float32)(b)
+    args = (W.indptr, W.indices, W.data, xp.int32(n), X, a if a is not None else xp.uint64(0), rb, Y)  # 0: null
     if C >= COLS_MIN:
         k = _module(_COLS_SRC, NC=C, LC=min(32, 1 << (C - 1).bit_length()), REAL=real).get_function("spmm_axpy")
         k(((n * 32 + 255) // 256,), (256,), args)
@@ -406,27 +402,25 @@ class FusedPush:
     """
 
     def __init__(self, W, C, group="auto", threads=256, blocks_per_sm=8):
-        import cupy
-        n, double = W.shape[0], W.data.dtype == np.float64
+        n, double = W.shape[0], W.data.dtype == xp.float64
         self.W, self.C, self.gs = W, C, min(_group(W, group), 32)
         mod = _module(_FUSED_SRC, GS=self.gs, NC=C, REAL="double" if double else "float", IS_DOUBLE=int(double))
         self.k_push, self.k_compact = mod.get_function("push_round"), mod.get_function("compact_frontier")
-        z = lambda *s: cupy.zeros(s, dtype=cupy.int32)  # noqa: E731
+        z = lambda *s: xp.zeros(s, dtype=xp.int32)  # noqa: E731
         self.front, self.touched, self.mark, self.fcnt, self.tcnt = z(2, n), z(n), z(n), z(2), z(2)
-        self.edges = cupy.zeros(1, dtype=cupy.uint64)
-        self.grid = (cupy.cuda.Device().attributes["MultiProcessorCount"] * blocks_per_sm,)
+        self.edges = xp.zeros(1, dtype=xp.uint64)
+        self.grid = (xp.cuda.Device().attributes["MultiProcessorCount"] * blocks_per_sm,)
         self.block = (threads,)
 
     def run(self, Z, R, diag, eps, cand, max_rounds, check_every=8):
         """Push until no vertex violates; returns (rounds, converged, edge visits)."""
-        import cupy
         n0, W = int(cand.shape[0]), self.W
         self.edges[:] = 0
         if not n0:
             return 0, True, 0
         self.front[0, :n0], self.fcnt[:], self.tcnt[:] = cand, 0, 0
         self.fcnt[0] = n0
-        eps, rounds = cupy.ascontiguousarray(eps, dtype=Z.dtype), 0
+        eps, rounds = xp.ascontiguousarray(eps, dtype=Z.dtype), 0
         while rounds < max_rounds:
             p, q = rounds & 1, 1 - (rounds & 1)
             fp, fq, tp, tq = self.fcnt[p:p + 1], self.fcnt[q:q + 1], self.tcnt[p:p + 1], self.tcnt[q:q + 1]
@@ -443,15 +437,15 @@ class FrontierOps:
     """Frontier primitives bound to one CSR matrix and column count."""
 
     def __init__(self, W, C, group="auto", threads=256, mapping="auto"):
-        self.B, self.W, self.C, self.threads = backend.get(), W, C, threads
+        self.W, self.C, self.threads = W, C, threads
         self.gs = _group(W, group)
-        self.real = np.float64 if W.data.dtype == np.float64 else np.float32
+        self.real = xp.float64 if W.data.dtype == xp.float64 else xp.float32
         self.mapping = mapping if mapping != "auto" else ("cols" if C >= COLS_MIN else "rows")
-        self.use_kernel = self.B.is_gpu and (self.mapping == "cols" or C <= MAX_KERNEL_COLS)
-        self.edges = self.B.xp.zeros((), dtype=self.B.xp.int64)  # device-side edge-visit counter
+        self.use_kernel = (self.mapping == "cols" or C <= MAX_KERNEL_COLS)
+        self.edges = xp.zeros((), dtype=xp.int64)  # device-side edge-visit counter
 
     def _launch(self, name, ngroups, *args):
-        real = "double" if self.real is np.float64 else "float"
+        real = "double" if self.real is xp.float64 else "float"
         if self.mapping == "cols" and name != "mark_neighbors":  # one warp per row
             lc = min(32, 1 << max(self.C - 1, 0).bit_length())
             k = _module(_COLS_SRC, NC=self.C, LC=lc, REAL=real).get_function(name)
@@ -464,12 +458,12 @@ class FrontierOps:
 
     def _rows(self, rows):
         ip = self.W.indptr
-        self.edges += (ip[rows + 1] - ip[rows]).sum(dtype=self.B.xp.int64)
-        return rows.astype(self.B.xp.int32), np.int32(rows.shape[0])
+        self.edges += (ip[rows + 1] - ip[rows]).sum(dtype=xp.int64)
+        return rows.astype(xp.int32), xp.int32(rows.shape[0])
 
     def jacobi(self, frontier, X, rhs, diag, delta):
         """New values for frontier rows and a changed-by-more-than-delta flag."""
-        xp, W = self.B.xp, self.W
+        W = self.W
         f, nf = self._rows(frontier)
         if self.use_kernel:
             Y, ch = xp.empty((int(nf), self.C), dtype=X.dtype), xp.empty(int(nf), dtype=xp.uint8)
@@ -481,14 +475,14 @@ class FrontierOps:
 
     def push(self, frontier, D, R, mark):
         """R += W[:, frontier] @ D (W symmetric) and mark touched vertices."""
-        xp, W = self.B.xp, self.W
+        W = self.W
         f, nf = self._rows(frontier)
         if self.use_kernel:
             return self._launch("push_scatter", int(nf), W.indptr, W.indices, W.data, f, nf,
                                 xp.ascontiguousarray(D), R, mark)
         sub = W[frontier]
         seg = xp.searchsorted(sub.indptr[1:], xp.arange(sub.nnz), side="right")
-        self.B.scatter_add(R, sub.indices, sub.data[:, None] * D[seg])
+        scatter_add(R, sub.indices, sub.data[:, None] * D[seg])
         mark[sub.indices] = 1
 
     def mark_neighbors(self, rows, mark):

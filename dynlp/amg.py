@@ -13,7 +13,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
-from . import backend
+from .backend import csr, scatter_add, scatter_max, scatter_min, xp
 from .graphs import coalesce, csr_rows
 
 
@@ -31,18 +31,16 @@ class Level:
 
 def _handshake(n, rows, cols, w, rounds):
     """Heavy-edge handshake matching; unmatched vertices join a matched neighbour."""
-    B = backend.get()
-    xp = B.xp
     agg = xp.full(n, -1, dtype=xp.int64)
     matched = xp.zeros(n, dtype=bool)
     ar = xp.arange(n, dtype=xp.int64)
 
     def best_choice(er, ec, ew):
         best = xp.full(n, -xp.inf, dtype=ew.dtype)
-        B.scatter_max(best, er, ew)
+        scatter_max(best, er, ew)
         tie = ew >= best[er]
         choice = xp.full(n, n, dtype=xp.int64)
-        B.scatter_min(choice, er[tie], ec[tie].astype(xp.int64))
+        scatter_min(choice, er[tie], ec[tie].astype(xp.int64))
         return choice
 
     for _ in range(rounds):
@@ -67,14 +65,12 @@ def _handshake(n, rows, cols, w, rounds):
 
 
 def _coarsen(W, s, agg, nc):
-    B = backend.get()
-    xp = B.xp
     rows = csr_rows(W)
     rc, cc = agg[rows], agg[W.indices]
     off = rc != cc
     Wc = coalesce(rc[off], cc[off], W.data[off], nc, W.data.dtype)
     sc = xp.zeros(nc, dtype=s.dtype)
-    B.scatter_add(sc, agg, s)
+    scatter_add(sc, agg, s)
     return Wc, sc
 
 
@@ -83,8 +79,6 @@ class AMG:
 
     def __init__(self, W, s, *, max_coarse=1500, passes=2, rounds=3, omega=0.7, nu=1,
                  max_levels=25, min_ratio=0.85, coarse_sweeps=20):
-        B = backend.get()
-        xp = B.xp
         self.omega, self.nu, self.coarse_sweeps = omega, nu, coarse_sweeps
         self.levels: list[Level] = []
         dt = W.data.dtype
@@ -101,7 +95,7 @@ class AMG:
             if nc > min_ratio * n:
                 break
             Wc, sc = _coarsen(cur.W, cur.s, agg, nc)
-            P = B.csr(xp.ones(n, dtype=dt), agg.astype(xp.int32), xp.arange(n + 1, dtype=xp.int32), (n, nc))
+            P = csr(xp.ones(n, dtype=dt), agg.astype(xp.int32), xp.arange(n + 1, dtype=xp.int32), (n, nc))
             cur.agg, cur.PT = agg, P.T.tocsr()
             self.levels.append(cur)
             cur = Level(Wc, sc, sc + Wc @ xp.ones(nc, dtype=dt))

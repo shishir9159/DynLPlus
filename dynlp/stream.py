@@ -3,16 +3,14 @@
 Per batch, the harmonic system on the active unlabeled set U:
     (diag - W_UU) F_U = rhs,   diag = s + rowsum(W_UU),   s = w(u, L) + eta
 s is each vertex's grounding (weight to labeled vertices plus the dongle eta).
-Binary problems solve one column (class 1); K classes solve K columns (SpMM).
+Binary problems solve one column (class 1); K classes solve K columns.
 """
 from __future__ import annotations
 
 from dataclasses import dataclass, field, replace
 
-import numpy as np
-
-from . import backend
-from .cc import connected_components
+from .backend import csr, scatter_add, xp
+from .cc import adaptive_components, connected_components
 from .graphs import Dataset, csr_rows, row_positions
 
 
@@ -28,8 +26,7 @@ class System:
     prior: object      # (C,)
     is_new: object     # rows not in U at the previous batch
     seed: object       # DynLP's affected set: new, N(inserted), N(deleted)
-    comp: object       # tau-component of each new vertex
-    n_comp: int
+    comps: dict        # new vertices' components: {"tau": (labels, n), "fh": (labels, n)}
     K: int
     C: int
     eta: float
@@ -51,79 +48,91 @@ class System:
 
     def astype(self, dtype) -> "System":
         """Same system in another precision (cached; index arrays shared)."""
-        dt = np.dtype(dtype)
+        dt = xp.dtype(dtype)
         if dt == self.W.data.dtype:
             return self
         if dt not in self._conv:
-            W = backend.get().csr(self.W.data.astype(dt), self.W.indices, self.W.indptr, self.W.shape)
             cast = {k: getattr(self, k).astype(dt) for k in ("s", "diag", "B", "rhs", "prior")}
+            W = csr(self.W.data.astype(dt), self.W.indices, self.W.indptr, self.W.shape)
             self._conv[dt] = replace(self, W=W, _conv={}, **cast)
         return self._conv[dt]
 
 
 def _local(ids, n):
-    xp = backend.get().xp
     loc = xp.full(n, -1, dtype=xp.int32)
     loc[ids] = xp.arange(ids.shape[0], dtype=xp.int32)
     return loc
 
 
+def new_components(m, lr, lc, w, tau, wmax, ground):
+    """DynLP step 1 for the m new vertices, from every stored entry (lr -> lc, w) of their
+    rows (lc = -1 when the neighbour isn't new): the paper's components over edges heavier
+    than the global mean tau, and adaptive ones (cc.adaptive_components), whose local
+    scale is each vertex's mean dissimilarity over all its edges; ground = label weight."""
+    on = w > 0
+    s, cnt = xp.zeros(m, dtype=xp.float32), xp.zeros(m, dtype=xp.float32)
+    scatter_add(s, lr, xp.where(on, 1 - w / wmax, 0).astype(xp.float32))
+    scatter_add(cnt, lr, on.astype(xp.float32))
+    s = s / xp.maximum(cnt, 1) + 1e-6
+    e = on & (lc >= 0)
+    r, c, w = lr[e], lc[e], w[e]
+    heavy = w > tau
+    return {"tau": connected_components(m, r[heavy], c[heavy]),
+            "fh": adaptive_components(m, r, c, w, s[r], s[c], wmax, ground.astype(xp.float32))}
+
+
 class Stream:
-    """Reveals a dataset in batches: an initial snapshot, then batches of new
-    vertices (a label_frac share with ground truth) plus deletions of del_frac x
-    batch-size random active unlabeled vertices (the paper's protocol)."""
+    """Reveals a dataset in batches: an initial snapshot, then batches of new vertices
+    (a label_frac share with ground truth) plus deletions of del_frac x batch-size random
+    active unlabeled vertices (the paper's protocol). The schedule is drawn up front."""
 
     def __init__(self, ds: Dataset, *, label_frac=0.01, init_frac=0.1, n_batches=10,
                  del_frac=0.1, eta_rel=0.0, seed=0, dtype="float32"):
-        be = backend.get()
-        xp = be.xp
         self.ds, self.dtype, self.del_frac = ds, dtype, del_frac
-        n, K = ds.n, ds.K
-        rs = self.rs = np.random.RandomState(seed + 7)
-        y = be.asnumpy(ds.y)
-        lab = np.zeros(n, bool)
-        lab[rs.choice(np.flatnonzero(y >= 0), size=max(K, int(label_frac * n)), replace=False)] = True
+        n, K, y = ds.n, ds.K, ds.y
+        rs = self.rs = xp.random.RandomState(seed + 7)
+        cand = xp.flatnonzero(y >= 0)
+        lab = xp.zeros(n, dtype=bool)
+        lab[cand[rs.permutation(cand.shape[0])[: max(K, int(label_frac * n))]]] = True
         order, n0 = ds.order.copy(), max(int(init_frac * n), 2 * K)
-        pos = np.empty(n, np.int64)
-        pos[order] = np.arange(n)
+        pos = xp.empty(n, dtype=xp.int64)
+        pos[order] = xp.arange(n)
         for c in range(K):  # the initial snapshot needs a labeled vertex of every class
-            lc = np.flatnonzero(lab & (y == c))
-            if lc.size == 0:
-                lc = np.flatnonzero(y == c)[:1]
+            lc = xp.flatnonzero(lab & (y == c))
+            if not lc.shape[0]:
+                lc = xp.flatnonzero(y == c)[:1]
                 lab[lc] = True
-            if lc.size and pos[lc].min() >= n0:
-                v, j = lc[0], rs.choice(np.flatnonzero(~lab[order[:n0]]))
-                a, pv = order[j], pos[v]
+            if lc.shape[0] and int(pos[lc].min()) >= n0:
+                free = xp.flatnonzero(~lab[order[:n0]])
+                v, j = int(lc[0]), int(free[int(rs.randint(0, free.shape[0]))])
+                a, pv = int(order[j]), int(pos[v])
                 order[j], order[pv], pos[v], pos[a] = v, a, j, pv
-        self.labeled_host, self.order, self.n0 = lab, order, n0
-        self.chunks = np.array_split(order[n0:], n_batches) if n_batches > 0 else []
-        self.labeled, self.y, self.rows = xp.asarray(lab), ds.y, csr_rows(ds.A)
-        self.tau = float(ds.A.data.mean())
+        self.labeled, self.order, self.n0, self.y = lab, order, n0, y
+        self.chunks = xp.array_split(order[n0:], n_batches) if n_batches > 0 else []
+        self.rows, self.tau, self.wmax = csr_rows(ds.A), float(ds.A.data.mean()), float(ds.A.data.max())
         self.eta = float(eta_rel * ds.A.data.sum() / n)
         self.prior = xp.full(1 if K == 2 else K, 0.5 if K == 2 else 1.0 / K, dtype=dtype)
-        self.schedule = self._make_schedule()  # drawn up front: identical batches for every stream class
+        self.schedule = self._make_schedule()
 
     def _make_schedule(self):
-        active, sched, none = np.zeros(self.ds.n, bool), [], np.zeros(0, np.int64)
+        active, sched, none = xp.zeros(self.ds.n, dtype=bool), [], xp.zeros(0, dtype=xp.int64)
         for t in range(1 + len(self.chunks)):
-            ins, dele = (self.order[: self.n0], none) if t == 0 else (self.chunks[t - 1], none)
+            ins, dele = (self.order[: self.n0] if t == 0 else self.chunks[t - 1]), none
             if t:
-                pool = np.flatnonzero(active & ~self.labeled_host)
-                nd = min(int(self.del_frac * len(ins)), max(pool.size - 1, 0))
+                pool = xp.flatnonzero(active & ~self.labeled)
+                nd = min(int(self.del_frac * ins.shape[0]), max(pool.shape[0] - 1, 0))
                 if nd > 0:
-                    dele = self.rs.choice(pool, size=nd, replace=False)
+                    dele = pool[self.rs.permutation(pool.shape[0])[:nd]]
             active[ins], active[dele] = True, False
-            sched.append((np.asarray(ins, np.int64), np.asarray(dele, np.int64)))
+            sched.append((ins.astype(xp.int64), dele.astype(xp.int64)))
         return sched
 
     def __len__(self):
         return len(self.schedule)
 
     def batches(self):
-        xp = backend.get().xp
         active, prevU = xp.zeros(self.ds.n, dtype=bool), xp.zeros(self.ds.n, dtype=bool)
         for t, (ins, dele) in enumerate(self.schedule):
-            ins, dele = xp.asarray(ins), xp.asarray(dele)
             active[ins], active[dele] = True, False
             sys = self._build(t, active, prevU, ins, dele)
             prevU = xp.zeros(self.ds.n, dtype=bool)
@@ -131,8 +140,6 @@ class Stream:
             yield sys
 
     def _build(self, t, active, prevU, ins, dele) -> System:
-        be = backend.get()
-        xp = be.xp
         A, K, dt = self.ds.A, self.ds.K, self.dtype
         n, rows, cols = A.shape[0], self.rows, A.indices
         onehot = xp.zeros((n, K), dtype=dt)
@@ -145,7 +152,7 @@ class Stream:
         loc, keep = _local(U0, n), Um[rows] & Um[cols]
         lab, ncomp = connected_components(int(U0.shape[0]), loc[rows[keep]], loc[cols[keep]])
         gw = xp.zeros(ncomp, dtype=dt)
-        be.scatter_add(gw, lab, Bfull[U0].sum(axis=1).astype(dt))
+        scatter_add(gw, lab, Bfull[U0].sum(axis=1).astype(dt))
         grounded = gw[lab] > 0
         Um = Um.copy()
         Um[U0[~grounded]] = False
@@ -153,38 +160,36 @@ class Stream:
         n_u, loc, keep = int(U.shape[0]), _local(U, n), Um[rows] & Um[cols]
         indptr = xp.zeros(n_u + 1, dtype=xp.int32)  # CSR order survives the filter
         indptr[1:] = xp.cumsum(xp.bincount(loc[rows[keep]], minlength=n_u))
-        W = be.csr(A.data[keep].astype(dt), loc[cols[keep]], indptr, (n_u, n_u))
+        W = csr(A.data[keep].astype(dt), loc[cols[keep]], indptr, (n_u, n_u))
         Bm = Bfull[U].astype(dt)
-        s = (Bm.sum(axis=1) + np.dtype(dt).type(self.eta)).astype(dt)
+        s = (Bm.sum(axis=1) + self.eta).astype(dt)
         diag = (s + W @ xp.ones(n_u, dtype=dt)).astype(dt)
         rhs = ((Bm[:, 1:2] if K == 2 else Bm) + self.eta * self.prior[None, :]).astype(dt)
         is_new = ~prevU[U]
         touch = xp.zeros(n, dtype=dt)
         touch[ins], touch[dele] = 1, 1
         seed = is_new | ((A @ touch)[U] > 0)
-        new = xp.flatnonzero(is_new)  # DynLP step 1: tau-components of new vertices
-        nl, rW = _local(new, n_u), csr_rows(W)
-        e = is_new[rW] & is_new[W.indices] & (W.data > self.tau)
-        comp, n_comp = connected_components(int(new.shape[0]), nl[rW[e]], nl[W.indices[e]])
-        return System(t, U, W, s, diag, Bm, rhs, self.prior.astype(dt), is_new, seed, comp, n_comp,
-                      K, 1 if K == 2 else K, self.eta, int(ins.shape[0]), int(dele.shape[0]),
-                      int(active.sum()), int((~grounded).sum()))
+        nl, rW = _local(xp.flatnonzero(is_new), n_u), csr_rows(W)
+        on = is_new[rW]
+        comps = new_components(int(is_new.sum()), nl[rW[on]], nl[W.indices[on]], W.data[on], self.tau, self.wmax,
+                               Bm[is_new].sum(axis=1))
+        return System(t, U, W, s, diag, Bm, rhs, self.prior.astype(dt), is_new, seed, comps, K, 1 if K == 2 else K,
+                      self.eta, int(ins.shape[0]), int(dele.shape[0]), int(active.sum()), int((~grounded).sum()))
 
 
 class IncrementalStream(Stream):
     """The same stream with the batch system resident and updated in place.
 
-    Vertices keep global ids; rows outside U (inactive, labeled, ungrounded) are
-    inert (diag 1, rhs 0, no edges), so every solver runs unchanged. Edge weights
-    are masked in place via a reverse-entry index, row sums and class weights are
-    updated by increments, and groundedness is re-checked locally (new/ungrounded
-    vertices on insertion, a bounded ball around deletions, full CC as fallback).
-    Returned arrays are live until the next batch is built.
+    Vertices keep global ids; rows outside U (inactive, labeled, ungrounded) are inert
+    (diag 1, rhs 0, no edges), so every solver runs unchanged. Edge weights are masked in
+    place via a reverse-entry index, row sums and class weights are updated by increments,
+    and groundedness is re-checked locally (new/ungrounded vertices on insertion, a bounded
+    ball around deletions, full CC as fallback). Returned arrays are live until the next batch.
     """
 
     def __init__(self, ds: Dataset, *, ball_hops=3, **kw):
         super().__init__(ds, **kw)
-        xp, A = backend.get().xp, ds.A
+        A = ds.A
         self.ball_hops, self.counters = ball_hops, {"ball_checks": 0, "full_ground": 0}
         perm = xp.argsort(A.indices.astype(xp.int64) * A.shape[0] + self.rows)  # A is symmetric
         self.rev = xp.empty(A.nnz, dtype=xp.int32)  # rev[p]: entry (v, u) of entry p = (u, v)
@@ -192,7 +197,7 @@ class IncrementalStream(Stream):
 
     def _edges(self, V):
         pos, seg = row_positions(self.ds.A.indptr, V)
-        return pos, V.astype(backend.get().xp.int64)[seg]
+        return pos, V.astype(xp.int64)[seg]
 
     def _set_w(self, pos, w):
         self.W64.data[pos] = w
@@ -200,8 +205,6 @@ class IncrementalStream(Stream):
 
     def _toggle(self, T, entering):
         """T enters U (Umask already includes T) or leaves it (Umask already excludes T)."""
-        be = backend.get()
-        xp = be.xp
         if not T.shape[0]:
             return
         pos, rows = self._edges(T)
@@ -215,27 +218,24 @@ class IncrementalStream(Stream):
             self._set_w(pos, w)
             self._set_w(self.rev[pos[other]], w[other])
             self.rowsum[T] = 0
-            be.scatter_add(self.rowsum, rows, w)
-            be.scatter_add(self.rowsum, cols[other], w[other])
+            scatter_add(self.rowsum, rows, w)
+            scatter_add(self.rowsum, cols[other], w[other])
         else:
             old = self.W64.data[pos]
             self._set_w(pos, xp.zeros_like(old))
             self._set_w(self.rev[pos[on]], xp.zeros(int(on.sum())))
-            be.scatter_add(self.rowsum, cols[on], -old[on])
+            scatter_add(self.rowsum, cols[on], -old[on])
             self.rowsum[T] = 0
 
     def _label_update(self, L, sign):
         """B[v, y_l] += sign * w(v, l) for every neighbour v of the labeled vertices L."""
-        be = backend.get()
-        xp = be.xp
         if L.shape[0]:
             pos, rows = self._edges(L)
             idx = self.ds.A.indices[pos].astype(xp.int64) * self.ds.K + self.y[rows].astype(xp.int64)
-            be.scatter_add(self.Bm.reshape(-1), idx, sign * self.ds.A.data[pos].astype(xp.float64))
+            scatter_add(self.Bm.reshape(-1), idx, sign * self.ds.A.data[pos].astype(xp.float64))
 
     def _deletion_check(self, dele):
         """Vertices of U that the deletions cut off from every labeled vertex."""
-        xp = backend.get().xp
         A, n, empty = self.ds.A, self.ds.n, xp.zeros(0, dtype=xp.int64)
         if not dele.shape[0]:
             return empty
@@ -273,7 +273,6 @@ class IncrementalStream(Stream):
         return ungr[self.Umask[ungr]].astype(xp.int64)
 
     def _full_ground_check(self):
-        xp = backend.get().xp
         rows, cols, n = self.rows, self.ds.A.indices, self.ds.n
         self.counters["full_ground"] += 1
         keep = self.active[rows] & self.active[cols] & ~self.labeled[rows]
@@ -282,7 +281,6 @@ class IncrementalStream(Stream):
 
     def _insertion_ground(self):
         """Vertices outside U (new or ungrounded) that now reach a labeled vertex."""
-        xp = backend.get().xp
         X = xp.flatnonzero(self.active & ~self.labeled & ~self.Umask).astype(xp.int64)
         m = int(X.shape[0])
         if not m:
@@ -300,17 +298,14 @@ class IncrementalStream(Stream):
         return mask
 
     def batches(self):
-        be = backend.get()
-        xp = be.xp
         A, K, dt, n = self.ds.A, self.ds.K, self.dtype, self.ds.n
-        f64, empty = xp.float64, xp.zeros(0, dtype=xp.int64)
+        f64, ids = xp.float64, xp.arange(n, dtype=xp.int64)
         self.active, self.Umask = xp.zeros(n, dtype=bool), xp.zeros(n, dtype=bool)
-        self.W64 = be.csr(xp.zeros(A.nnz, dtype=f64), A.indices, A.indptr, A.shape)
-        self.Wd = be.csr(xp.zeros(A.nnz, dtype=dt), A.indices, A.indptr, A.shape)
+        self.W64 = csr(xp.zeros(A.nnz, dtype=f64), A.indices, A.indptr, A.shape)
+        self.Wd = csr(xp.zeros(A.nnz, dtype=dt), A.indices, A.indptr, A.shape)
         self.rowsum, self.Bm = xp.zeros(n, dtype=f64), xp.zeros((n, K), dtype=f64)
-        ids, prior64, prevU = xp.arange(n, dtype=xp.int64), self.prior.astype(f64), xp.zeros(n, dtype=bool)
+        prior64, prevU = self.prior.astype(f64), xp.zeros(n, dtype=bool)
         for t, (ins, dele) in enumerate(self.schedule):
-            ins, dele = xp.asarray(ins), xp.asarray(dele)
             self.active[dele] = False  # 1. deletions
             leaving = dele[self.Umask[dele]]
             self.Umask[leaving] = False
@@ -336,18 +331,16 @@ class IncrementalStream(Stream):
             rhs64 = xp.where(Um[:, None], (self.Bm[:, 1:2] if K == 2 else self.Bm) + self.eta * prior64, 0.0)
             is_new = Um & ~prevU
             seed = self._neighbours(xp.concatenate([ins, dele]), is_new.copy()) & Um
-            new = xp.flatnonzero(is_new).astype(xp.int64)  # DynLP step 1: tau-components of new vertices
+            new = xp.flatnonzero(is_new).astype(xp.int64)
             locN = _local(new, n)
             pos, rows = self._edges(new)
-            cols = A.indices[pos]
-            e = (locN[cols] >= 0) & (self.Wd.data[pos] > self.tau)
-            comp, n_comp = connected_components(int(new.shape[0]), locN[rows[e]], locN[cols[e]])
-            common = (is_new, seed, comp, n_comp, K, 1 if K == 2 else K, self.eta, int(ins.shape[0]),
-                      int(dele.shape[0]), int(self.active.sum()), int((self.active & ~self.labeled & ~Um).sum()),
-                      Um.copy(), changed)
-            sys = System(t, ids, self.Wd, s64.astype(dt), diag64.astype(dt), self.Bm.astype(dt),
-                         rhs64.astype(dt), self.prior, *common)
-            if np.dtype(dt) != np.float64:
-                sys._conv[np.dtype(f64)] = System(t, ids, self.W64, s64, diag64, self.Bm, rhs64, prior64, *common)
+            comps = new_components(int(new.shape[0]), locN[rows], locN[A.indices[pos]], self.Wd.data[pos],
+                                   self.tau, self.wmax, self.Bm[new].sum(axis=1))
+            common = (is_new, seed, comps, K, 1 if K == 2 else K, self.eta, int(ins.shape[0]), int(dele.shape[0]),
+                      int(self.active.sum()), int((self.active & ~self.labeled & ~Um).sum()), Um.copy(), changed)
+            sys = System(t, ids, self.Wd, s64.astype(dt), diag64.astype(dt), self.Bm.astype(dt), rhs64.astype(dt),
+                         self.prior, *common)
+            if xp.dtype(dt) != f64:
+                sys._conv[xp.dtype(f64)] = System(t, ids, self.W64, s64, diag64, self.Bm, rhs64, prior64, *common)
             prevU = Um.copy()
             yield sys

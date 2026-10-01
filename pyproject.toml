@@ -4,14 +4,13 @@ version = "0.1.0"
 description = "Certified dynamic label propagation (DynLP+) research prototype"
 requires-python = ">=3.10"
 dependencies = [
-    "numpy>=1.26",
-    "scipy>=1.11",
     "pandas>=2.0",
+    "pyarrow>=15.0",
     "matplotlib>=3.8",
 ]
 
 [project.optional-dependencies]
-# pick the one matching `nvidia-smi` -> "CUDA Version"
+# required (GPU only): pick the one matching `nvidia-smi` -> "CUDA Version"
 cu12 = ["cupy-cuda12x>=13.0"]
 cu13 = ["cupy-cuda13x>=14.0"]
 
